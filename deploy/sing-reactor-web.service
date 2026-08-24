@@ -1,0 +1,20 @@
+[Unit]
+Description=Sing Reactor web API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=singreactor
+Group=singreactor
+WorkingDirectory=/opt/sing-reactor-web/current
+EnvironmentFile=/etc/sing-reactor-web.env
+ExecStart=/opt/singreactor/venv/bin/python server/server.py
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+PrivateTmp=true
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,13 @@
+.cache/
+.models/
+.tools/
+.ocr-test/
+prototype/
+node_modules/
+__pycache__/
+*.py[cod]
+*.log
+.sing-reactor.processes*.json
+.env
+.env.*
+!.env.example

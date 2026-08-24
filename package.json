@@ -1,0 +1,7 @@
+{
+  "name": "sing-reactor-tools",
+  "private": true,
+  "dependencies": {
+    "tesseract.js": "7.0.0"
+  }
+}
