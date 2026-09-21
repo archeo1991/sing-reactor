@@ -69,6 +69,68 @@ class RangeTests(unittest.TestCase):
                     http_safety.parse_single_range(value, 10)
 
 
+class LyricsPipelineMetadataTests(unittest.TestCase):
+    def test_page_selection_and_cache_keys_are_page_specific(self):
+        view = {
+            "title": "合辑", "cid": 11, "duration": 100,
+            "pages": [
+                {"page": 1, "cid": 11, "part": "第一首", "duration": 100},
+                {"page": 2, "cid": 22, "part": "第二首", "duration": 120},
+            ],
+        }
+        page, requested, total = server.select_bilibili_page(
+            view, "https://www.bilibili.com/video/BV1TEST?p=2"
+        )
+        self.assertEqual((page["cid"], requested, total), (22, 2, 2))
+        self.assertEqual(server.media_cache_key("https://www.bilibili.com/video/BV1TEST"), "BV1TEST-p1")
+        self.assertEqual(server.media_cache_key("https://www.bilibili.com/video/BV1TEST?p=2"), "BV1TEST-p2")
+
+    def test_metadata_keeps_version_and_language_signals(self):
+        metadata = server.build_song_metadata(
+            "歌手《示例歌》Live Cover",
+            "当前歌手",
+            {"title": "中文现场合辑", "desc": "翻唱版本", "duration": 200},
+            {"page": 2, "cid": 22, "part": "歌手《示例歌》Live Cover", "duration": 180},
+        )
+        self.assertEqual(metadata["song_title"], "示例歌")
+        self.assertEqual(metadata["language"], "zh")
+        self.assertTrue(metadata["is_live"])
+        self.assertTrue(metadata["is_cover"])
+        self.assertEqual(metadata["page"], 2)
+        self.assertEqual(metadata["cid"], 22)
+
+    def test_cover_candidate_requires_strong_audio_evidence(self):
+        metadata = {"artist": "翻唱歌手", "is_cover": True, "is_live": False, "version": "cover"}
+        candidate = {"artistName": "原唱歌手"}
+        weak = {"confidence": 0.77, "line_coverage": 0.8, "matched_count": 8}
+        strong = {"confidence": 0.9, "line_coverage": 0.8, "matched_count": 8}
+        self.assertFalse(server.cover_candidate_has_strong_audio(metadata, candidate, weak))
+        self.assertTrue(server.cover_candidate_has_strong_audio(metadata, candidate, strong))
+
+    def test_cover_search_does_not_lock_provider_to_performer_artist(self):
+        online_lyrics = [server.lyric_line(index * 20, f"第{index}句测试歌词内容") for index in range(10)]
+        view = {"title": "翻唱歌手《示例歌》Live Cover", "cid": 123, "duration": 180}
+        with patch.object(server, "normalize_bilibili_url", return_value="https://www.bilibili.com/video/BV1TEST"), \
+             patch.object(server, "fetch_video_view", return_value=view), \
+             patch.object(server, "fetch_subtitle_lines", return_value=[]), \
+             patch.object(server, "fetch_lyrics_from_netease", return_value=(online_lyrics, {"artistName": "原唱", "duration": 180})), \
+             patch.object(server, "fetch_lyrics_from_lrclib", return_value=([], None)) as lrclib, \
+             patch.object(server, "transcribe_audio_anchors", return_value=([], None, [])), \
+             patch.object(server, "calibrate_synced_lyrics", return_value=(online_lyrics, {"mode": "sampled_fixed_offset", "aligned_to_video": True, "avg_similarity": 0.9, "line_coverage": 0.8, "matched_count": 8}, [])), \
+             patch.object(server, "get_safe_video_stream_url", return_value=None), \
+             patch.object(server, "cached_video_path", return_value=ROOT / ".missing-test-video"):
+            server.identify("https://www.bilibili.com/video/BV1TEST")
+        self.assertEqual(lrclib.call_args.args[1], None)
+
+    def test_candidate_score_prioritizes_audio_evidence(self):
+        strong_audio = {"aligned_to_video": True, "confidence": 0.9, "line_coverage": 0.8, "character_coverage": 0.8, "time_coverage": 0.7}
+        weak_audio = {"aligned_to_video": True, "confidence": 0.45, "line_coverage": 0.4, "character_coverage": 0.4, "time_coverage": 0.3}
+        self.assertGreater(
+            server.candidate_total_score("bilibili_subtitle", {"score": 0.7}, strong_audio),
+            server.candidate_total_score("lrclib", {"score": 1.0}, weak_audio),
+        )
+
+
 class IdentifyTests(unittest.TestCase):
     @staticmethod
     def synced_lyrics():
@@ -84,7 +146,7 @@ class IdentifyTests(unittest.TestCase):
              patch.object(server, "fetch_video_view", return_value=view), \
              patch.object(server, "fetch_subtitle_lines", return_value=[]), \
              patch.object(server, "fetch_lyrics_from_netease", return_value=(online_lyrics, {"provider": "netease", "duration": 180})), \
-             patch.object(server, "fetch_lyrics_from_lrclib") as lrclib, \
+             patch.object(server, "fetch_lyrics_from_lrclib", return_value=([], None)) as lrclib, \
              patch.object(server, "align_candidate_lyrics", return_value=(aligned_lyrics, correction)), \
              patch.object(server, "calibrate_synced_lyrics") as sampled, \
              patch.object(server, "transcribe_audio_anchors", return_value=([{"text": "anchor"}], {"provider": "faster_whisper"}, [attempt])) as full, \
@@ -100,7 +162,7 @@ class IdentifyTests(unittest.TestCase):
         self.assertEqual(payload["recognitionAttempts"], [attempt])
         sampled.assert_not_called()
         full.assert_called_once_with("https://www.bilibili.com/video/BV1TEST", "zh")
-        lrclib.assert_not_called()
+        lrclib.assert_called_once_with("测试歌曲", None, 180.0)
         video_recognition.assert_not_called()
 
     def test_sampled_unavailable_keeps_original_synced_lyrics(self):
@@ -177,21 +239,74 @@ class IdentifyTests(unittest.TestCase):
         strong = {"correction": {"mode": "sampled_fixed_offset", "aligned_to_video": True, "avg_similarity": 0.84, "matched_count": 7, "window_count": 3}}
         self.assertGreater(server.synced_fallback_quality(strong, "lrclib"), server.synced_fallback_quality(weak, "netease"))
 
-    def test_bilibili_subtitles_call_no_whisper(self):
+    def test_bilibili_subtitles_are_validated_by_whisper(self):
         subtitles = self.synced_lyrics()
+        aligned = [server.lyric_line(line["seconds"] + 2, line["text"]) for line in subtitles]
+        correction = {
+            "mode": "asr_word_sequence_timeline", "aligned_to_video": True,
+            "confidence": 0.9, "line_coverage": 0.8, "matched_count": 8,
+        }
         view = {"title": "测试歌曲", "cid": 123, "duration": 180}
         with patch.object(server, "normalize_bilibili_url", return_value="https://www.bilibili.com/video/BV1TEST"), \
              patch.object(server, "fetch_video_view", return_value=view), \
              patch.object(server, "fetch_subtitle_lines", return_value=subtitles), \
+             patch.object(server, "fetch_lyrics_from_netease", return_value=([], None)), \
+             patch.object(server, "fetch_lyrics_from_lrclib", return_value=([], None)), \
+             patch.object(server, "align_candidate_lyrics", return_value=(aligned, correction)), \
              patch.object(server, "calibrate_synced_lyrics") as sampled, \
-             patch.object(server, "transcribe_audio_anchors") as full, \
+             patch.object(server, "transcribe_audio_anchors", return_value=([{"text": "anchor"}], {"provider": "faster_whisper"}, [])) as full, \
              patch.object(server, "get_safe_video_stream_url", return_value=None), \
              patch.object(server, "cached_video_path", return_value=ROOT / ".missing-test-video"):
             payload, status = server.identify("https://www.bilibili.com/video/BV1TEST")
         self.assertEqual(status, 200)
         self.assertEqual(payload["lyricsSource"], "bilibili_subtitle")
+        self.assertEqual(payload["lyrics"], aligned)
         sampled.assert_not_called()
-        full.assert_not_called()
+        full.assert_called_once_with("https://www.bilibili.com/video/BV1TEST", "zh")
+
+    def test_whisper_text_is_returned_before_video_ocr_fallback(self):
+        anchors = [
+            {"start": 3.0, "end": 5.0, "text": "第一句识别歌词"},
+            {"start": 8.0, "end": 10.0, "text": "第二句识别歌词"},
+        ]
+        view = {"title": "未知歌曲", "cid": 123, "duration": 120}
+        with patch.object(server, "normalize_bilibili_url", return_value="https://www.bilibili.com/video/BV1UNKNOWN"), \
+             patch.object(server, "fetch_video_view", return_value=view), \
+             patch.object(server, "fetch_subtitle_lines", return_value=[]), \
+             patch.object(server, "fetch_lyrics_from_netease", return_value=([], None)), \
+             patch.object(server, "fetch_lyrics_from_lrclib", return_value=([], None)), \
+             patch.object(server, "get_known_lyrics", return_value=[]), \
+             patch.object(server, "transcribe_audio_anchors", return_value=(anchors, {"provider": "faster_whisper"}, [])), \
+             patch.object(server, "attempt_video_recognition") as video_recognition, \
+             patch.object(server, "get_safe_video_stream_url", return_value=None), \
+             patch.object(server, "cached_video_path", return_value=ROOT / ".missing-test-video"):
+            payload, status = server.identify("https://www.bilibili.com/video/BV1UNKNOWN")
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["lyricsSource"], "whisper")
+        self.assertEqual([line["text"] for line in payload["lyrics"]], ["第一句识别歌词", "第二句识别歌词"])
+        self.assertEqual(payload["lyricsMeta"]["mode"], "none")
+        video_recognition.assert_not_called()
+
+    def test_weak_cover_candidate_cannot_use_original_lrc_fallback(self):
+        candidate = self.synced_lyrics()
+        anchors = [{"start": 1.0, "end": 2.0, "text": "Whisper fallback"}]
+        view = {"title": "翻唱歌手《示例歌》Cover", "cid": 123, "duration": 180}
+        weak = {"mode": "unverified", "aligned_to_video": False, "reason": "low_text_similarity", "confidence": 0.2}
+        with patch.object(server, "normalize_bilibili_url", return_value="https://www.bilibili.com/video/BV1TEST"), \
+             patch.object(server, "fetch_video_view", return_value=view), \
+             patch.object(server, "fetch_subtitle_lines", return_value=[]), \
+             patch.object(server, "fetch_lyrics_from_netease", return_value=(candidate, {"artistName": "原唱歌手", "duration": 180})), \
+             patch.object(server, "fetch_lyrics_from_lrclib", return_value=([], None)), \
+             patch.object(server, "align_candidate_lyrics", return_value=(candidate, weak)), \
+             patch.object(server, "transcribe_audio_anchors", return_value=(anchors, {"provider": "faster_whisper"}, [])), \
+             patch.object(server, "calibrate_synced_lyrics") as sampled, \
+             patch.object(server, "get_safe_video_stream_url", return_value=None), \
+             patch.object(server, "cached_video_path", return_value=ROOT / ".missing-test-video"):
+            payload, status = server.identify("https://www.bilibili.com/video/BV1TEST")
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["lyricsSource"], "whisper")
+        self.assertEqual(payload["lyricsMeta"]["rejectedCandidates"][0]["reason"], "weak_cover_audio_evidence")
+        sampled.assert_not_called()
 
     def test_recognition_attempts_accumulate_across_fallbacks(self):
         speech_attempt = {"stage": "speech_anchors", "status": "no_result"}
@@ -585,11 +700,11 @@ class SampledAlignmentTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp, \
              patch.object(server, "SPEECH_CACHE_DIR", Path(tmp)), \
              patch.object(server, "resolve_whisper_model", return_value="tiny"):
-            payload = {"version": 3, "segments": [segment], "meta": {"model": "tiny", "languageHint": "zh"}}
+            payload = {"version": 3, "pipelineVersion": server.LYRICS_PIPELINE_VERSION, "segments": [segment], "meta": {"model": "tiny", "languageHint": "zh"}}
             self.assertTrue(server.save_cached_speech("url", payload))
             self.assertEqual(server.load_cached_speech("url", "zh")["version"], 3)
             self.assertIsNone(server.load_cached_speech("url", None))
-            server.cached_speech_path("url").write_text(json.dumps({"version": 3, "segments": [], "meta": {"model": "tiny", "languageHint": "zh"}}), encoding="utf-8")
+            server.cached_speech_path("url").write_text(json.dumps({"version": 3, "pipelineVersion": server.LYRICS_PIPELINE_VERSION, "segments": [], "meta": {"model": "tiny", "languageHint": "zh"}}), encoding="utf-8")
             self.assertIsNone(server.load_cached_speech("url", "zh"))
 
     def test_empty_model_result_is_no_result_and_not_cached(self):

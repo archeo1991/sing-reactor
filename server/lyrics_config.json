@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "pipeline_version": 2,
+  "provider_quality": {
+    "bilibili_subtitle": 0.72,
+    "netease": 0.85,
+    "lrclib": 0.9,
+    "known_lyrics": 0.7,
+    "video_recognition": 0.5,
+    "whisper": 0.35
+  },
+  "candidate_selection": {
+    "metadata_weight": 0.14,
+    "provider_weight": 0.06,
+    "audio_weight": 0.8,
+    "cover_min_confidence": 0.78,
+    "cover_min_line_coverage": 0.55,
+    "cover_min_matches": 5
+  },
+  "fallback": {
+    "allow_original_synced": true,
+    "allow_whisper_text": true
+  }
+}

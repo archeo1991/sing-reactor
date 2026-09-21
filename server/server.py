@@ -23,6 +23,7 @@ from pathlib import Path
 from http_safety import UnsafeUrlError, parse_single_range, resolve_bilibili_redirects, validate_bilibili_url
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+LYRICS_CONFIG_PATH = Path(__file__).resolve().parent / "lyrics_config.json"
 VENDOR_PYTHON = PROJECT_ROOT / ".tools" / "python"
 if VENDOR_PYTHON.exists():
     sys.path.insert(0, str(VENDOR_PYTHON))
@@ -53,6 +54,26 @@ CACHE_MAX_BYTES = 2 * 1024 * 1024 * 1024
 CACHE_CLEAN_INTERVAL = 300
 SPEECH_CACHE_SCHEMA_VERSION = 3
 SAMPLED_SPEECH_CACHE_SCHEMA_VERSION = 3
+
+
+def load_lyrics_config():
+    try:
+        with LYRICS_CONFIG_PATH.open("r", encoding="utf-8") as stream:
+            config = json.load(stream)
+        if not isinstance(config, dict) or int(config.get("schema_version") or 0) != 1:
+            raise ValueError("invalid lyrics config schema")
+        return config
+    except (OSError, ValueError, json.JSONDecodeError):
+        return {
+            "schema_version": 1, "pipeline_version": 2,
+            "provider_quality": {"bilibili_subtitle": 0.72, "netease": 0.85, "lrclib": 0.9},
+            "candidate_selection": {"metadata_weight": 0.14, "provider_weight": 0.06, "audio_weight": 0.8},
+            "fallback": {"allow_original_synced": True, "allow_whisper_text": True},
+        }
+
+
+LYRICS_CONFIG = load_lyrics_config()
+LYRICS_PIPELINE_VERSION = int(LYRICS_CONFIG.get("pipeline_version") or 2)
 _CACHE_LOCKS = {}
 _CACHE_LOCKS_GUARD = threading.Lock()
 _CACHE_CLEAN_LOCK = threading.Lock()
@@ -118,6 +139,65 @@ def normalize_bilibili_url(value, resolve_redirects=False):
             "Referer": "https://www.bilibili.com/",
         })
     return safe_url
+
+
+def extract_page_number(url):
+    try:
+        value = parse_qs(urlparse(url).query).get("p", ["1"])[0]
+        return max(1, int(value))
+    except (TypeError, ValueError):
+        return 1
+
+
+def select_bilibili_page(view, url):
+    pages = list((view or {}).get("pages") or [])
+    requested = extract_page_number(url)
+    page = next((item for item in pages if int(item.get("page") or 0) == requested), None)
+    if page is None and pages and requested <= len(pages):
+        page = pages[requested - 1]
+    if page is None:
+        page = {
+            "page": 1, "cid": (view or {}).get("cid"),
+            "part": (view or {}).get("title") or "",
+            "duration": (view or {}).get("duration") or 0,
+        }
+    return page, requested, len(pages)
+
+
+def infer_metadata_language_hint(text):
+    text = str(text or "")
+    if re.search(r"[\u3040-\u30ff\u31f0-\u31ff]", text):
+        return "ja"
+    if re.search(r"[\uac00-\ud7a3]", text):
+        return "ko"
+    if len(re.findall(r"[\u3400-\u4dbf\u4e00-\u9fff]", text)) >= 2:
+        return "zh"
+    if len(re.findall(r"[A-Za-z]+", text)) >= 2:
+        return "en"
+    return "auto"
+
+
+def build_song_metadata(title, artist=None, view=None, page=None):
+    view = view or {}
+    page = page or {}
+    page_title = clean_title(page.get("part") or title)
+    total_title = clean_title(view.get("title") or title)
+    raw = " ".join(str(value or "") for value in (page_title, total_title, view.get("desc"), view.get("dynamic"), view.get("tname")))
+    terms = []
+    patterns = (("live", r"\blive\b|现场|現場|演唱会|演唱會|音乐节|音樂節"), ("cover", r"\bcover\b|翻唱|试唱|試唱"), ("instrumental", r"\binstrumental\b|伴奏|无人声|無人聲|off\s*vocal|karaoke"), ("remix", r"\bremix\b|重混|混音版"), ("remaster", r"\bremaster(?:ed)?\b|重制|修复版|修復版"), ("edit", r"\bedit\b|剪辑版|剪輯版|片段"))
+    for name, pattern in patterns:
+        if re.search(pattern, raw, re.I):
+            terms.append(name)
+    return {
+        "song_title": normalize_song_query(page_title) or normalize_song_query(total_title),
+        "display_title": page_title, "total_title": total_title,
+        "artist": artist or infer_artist_from_title(page_title) or infer_artist_from_title(total_title) or "",
+        "duration": float(page.get("duration") or view.get("duration") or 0),
+        "page": int(page.get("page") or 1), "cid": page.get("cid"),
+        "language": infer_metadata_language_hint(raw), "version_terms": terms,
+        "version": "_".join(terms), "is_live": "live" in terms,
+        "is_cover": "cover" in terms, "is_instrumental": "instrumental" in terms,
+    }
 
 
 def is_bilibili_url(value):
@@ -208,9 +288,10 @@ def fetch_bilibili_media_streams(url):
     if not bvid:
         return None
     view = fetch_video_view(bvid)
-    if not view or not view.get("cid"):
+    page, _, _ = select_bilibili_page(view, url)
+    if not view or not page.get("cid"):
         return None
-    query = urlencode({"bvid": bvid, "cid": view["cid"], "fnval": 16, "qn": 80, "fourk": 1})
+    query = urlencode({"bvid": bvid, "cid": page["cid"], "fnval": 16, "qn": 80, "fourk": 1})
     payload = request_json(f"https://api.bilibili.com/x/player/playurl?{query}")
     if payload.get("code") != 0:
         return None
@@ -1647,6 +1728,116 @@ def synced_fallback_quality(meta, provider_name=""):
     return (int(aligned), int(sampled), confidence, matched, windows, coverage, provider_text_quality)
 
 
+def provider_quality(provider):
+    return float((LYRICS_CONFIG.get("provider_quality") or {}).get(provider, 0.5))
+
+
+def candidate_match_type(song_metadata, candidate_meta):
+    detected_artist = str(song_metadata.get("artist") or "")
+    source_artist = str((candidate_meta or {}).get("artistName") or "")
+    same_artist = not detected_artist or not source_artist or text_similarity(detected_artist, source_artist) >= 0.72
+    if song_metadata.get("is_live"):
+        return "live"
+    if song_metadata.get("is_cover") or not same_artist:
+        return "cover"
+    if song_metadata.get("version"):
+        return "version"
+    return "exact"
+
+
+def candidate_audio_score(correction):
+    correction = correction or {}
+    if not correction.get("aligned_to_video"):
+        return 0.0
+    confidence = float(correction.get("confidence") or correction.get("avg_similarity") or correction.get("avgSimilarity") or 0)
+    line_coverage = float(correction.get("line_coverage") or correction.get("coverage") or 0)
+    character_coverage = float(correction.get("character_coverage") or correction.get("charCoverage") or line_coverage)
+    time_coverage = float(correction.get("time_coverage") or correction.get("timeSpanCoverage") or 0)
+    return min(1.0, confidence * 0.55 + line_coverage * 0.2 + character_coverage * 0.15 + time_coverage * 0.1)
+
+
+def candidate_total_score(provider, meta, correction):
+    config = LYRICS_CONFIG.get("candidate_selection") or {}
+    audio = candidate_audio_score(correction)
+    metadata = float((meta or {}).get("score") or (meta or {}).get("metadata_score") or 0)
+    return (
+        audio * float(config.get("audio_weight", 0.8))
+        + metadata * float(config.get("metadata_weight", 0.14))
+        + provider_quality(provider) * float(config.get("provider_weight", 0.06))
+    )
+
+
+def cover_candidate_has_strong_audio(song_metadata, meta, correction):
+    if candidate_match_type(song_metadata, meta) != "cover":
+        return True
+    config = LYRICS_CONFIG.get("candidate_selection") or {}
+    return (
+        float((correction or {}).get("confidence") or 0) >= float(config.get("cover_min_confidence", 0.78))
+        and float((correction or {}).get("line_coverage") or (correction or {}).get("coverage") or 0) >= float(config.get("cover_min_line_coverage", 0.55))
+        and int((correction or {}).get("matched_count") or (correction or {}).get("matched") or 0) >= int(config.get("cover_min_matches", 5))
+    )
+
+
+def standardized_lyrics_meta(provider, meta, correction, song_metadata, attempted_providers, rejected_candidates, mode=None):
+    correction = dict(correction or {})
+    internal_mode = str(correction.get("mode") or "")
+    if mode is None:
+        if internal_mode.startswith("sampled_") or internal_mode == "original_synced_fallback":
+            mode = "lrc_timeline_synced"
+        elif correction.get("aligned_to_video"):
+            mode = "lyrics_timeline_rebuilt"
+        else:
+            mode = "text_only"
+    match_type = candidate_match_type(song_metadata, meta)
+    metadata = {
+        "songTitle": song_metadata.get("song_title"),
+        "song_title": song_metadata.get("song_title"),
+        "detectedArtist": song_metadata.get("artist"),
+        "detected_artist": song_metadata.get("artist"),
+        "sourceArtist": (meta or {}).get("artistName") or "",
+        "source_artist": (meta or {}).get("artistName") or "",
+        "language": song_metadata.get("language"),
+        "version": song_metadata.get("version"),
+        "page": song_metadata.get("page"),
+        "cid": song_metadata.get("cid"),
+    }
+    timeline = {
+        "model": internal_mode or None,
+        "offset": correction.get("offset"), "scale": correction.get("scale", 1.0),
+        "rmse": correction.get("rmse"),
+        "anchorCount": correction.get("matched_count") or correction.get("matched") or 0,
+        "anchor_count": correction.get("matched_count") or correction.get("matched") or 0,
+    }
+    attempted = list(dict.fromkeys(attempted_providers))
+    return {
+        **(meta or {}),
+        "provider": provider,
+        "mode": mode,
+        "confidence": round(candidate_audio_score(correction), 3),
+        "matchType": match_type,
+        "match_type": match_type,
+        "metadata": metadata,
+        "timeline": timeline,
+        "attemptedProviders": attempted,
+        "attempted_providers": attempted,
+        "rejectedCandidates": rejected_candidates,
+        "pipelineVersion": LYRICS_PIPELINE_VERSION,
+        "correction": correction,
+    }
+
+
+def whisper_fallback_lines(anchors):
+    lines = []
+    for anchor in anchors or []:
+        text = str(anchor.get("text") or "").strip()
+        if text:
+            line = lyric_line(anchor.get("start", anchor.get("seconds", 0)), text)
+            if anchor.get("end") is not None:
+                line["end"] = float(anchor["end"])
+            lines.append(line)
+    return lines
+
+
 def parse_manual_lyrics(lyric_text):
     lyrics = parse_lrc(lyric_text or "")
     if lyrics:
@@ -1691,6 +1882,8 @@ def identify(url):
     title = infer_title_from_url(url)
     cid = KNOWN_CIDS.get(bvid)
     artist = KNOWN_ARTISTS.get(bvid)
+    page_number = extract_page_number(url)
+    song_metadata = {"song_title": normalize_song_query(title), "artist": artist or "", "language": "auto", "version": "", "version_terms": []}
     video_offset_seconds = KNOWN_VIDEO_OFFSETS.get(bvid, 0)
     bilibili_duration = 0
     title_source = "known" if bvid in KNOWN_TITLES else "url"
@@ -1709,15 +1902,14 @@ def identify(url):
     try:
         view = fetch_video_view(bvid)
         if view:
-            title = KNOWN_TITLES.get(bvid) or clean_title(view.get("title"))
-            artist = KNOWN_ARTISTS.get(bvid) or artist or infer_artist_from_title(view.get("title"))
-            cid = view.get("cid") or cid
-            bilibili_duration = float(view.get("duration") or 0)
+            page, page_number, _ = select_bilibili_page(view, url)
+            title = KNOWN_TITLES.get(bvid) or clean_title(page.get("part") or view.get("title"))
+            artist = KNOWN_ARTISTS.get(bvid) or artist or infer_artist_from_title(page.get("part")) or infer_artist_from_title(view.get("title"))
+            cid = page.get("cid") or cid
+            bilibili_duration = float(page.get("duration") or view.get("duration") or 0)
             title_source = "bilibili_api"
             platform_anchors = fetch_subtitle_lines(bvid, cid)
-            if platform_anchors:
-                lyrics = platform_anchors
-                lyrics_source = "bilibili_subtitle"
+            song_metadata = build_song_metadata(title, artist, view, page)
     except Exception as exc:
         warning = f"bilibili_api_failed: {exc.__class__.__name__}"
 
@@ -1737,98 +1929,126 @@ def identify(url):
             artist = artist or infer_artist_from_title(fetched)
             title_source = "media_tool"
 
-    if not platform_anchors:
-        for provider_name, provider in (("netease", fetch_lyrics_from_netease), ("lrclib", fetch_lyrics_from_lrclib)):
-            try:
-                matched_lyrics, matched_meta = provider(title, artist, bilibili_duration)
-                if not matched_lyrics:
-                    continue
-                text_only_lrclib = provider_name == "lrclib" and (matched_meta or {}).get("mode") == "text_only"
-                if provider_name == "netease" and matched_meta is not None:
-                    matched_meta.setdefault("mode", "synced_lrc")
-                candidate_duration = float((matched_meta or {}).get("duration") or 0)
-                lyric_times = [float(line.get("seconds") or 0) for line in matched_lyrics]
-                lyric_span = max(lyric_times) - min(lyric_times) if lyric_times else 0
-                sampled_eligible = (
-                    not text_only_lrclib
-                    and bilibili_duration >= 60
-                    and len(matched_lyrics) >= 8
-                    and lyric_span >= 45
-                )
-                candidate_language_hint = infer_lyrics_language_hint(matched_lyrics)
-                if not speech_attempted or speech_language_hint != candidate_language_hint:
-                    speech_anchors, speech_meta, speech_attempts = transcribe_audio_anchors(url, candidate_language_hint)
-                    speech_attempted = True
-                    speech_language_hint = candidate_language_hint
-                    recognition_attempts.extend(speech_attempts)
-                correction = None
-                if speech_anchors:
-                    aligned, correction = align_candidate_lyrics(matched_lyrics, speech_anchors, None, speech_meta)
-                    if correction and correction.get("aligned_to_video"):
-                        matched_lyrics = aligned
-                        matched_meta = matched_meta or {}
-                        matched_meta["correction"] = correction
-                if not correction or not correction.get("aligned_to_video"):
-                    if text_only_lrclib:
-                        warning = warning or "lrclib_lyrics_rejected: unverified_text_only"
-                        continue
-                    fallback_lyrics = matched_lyrics
-                    fallback_meta = dict(matched_meta or {})
-                    fallback_correction = {
-                        "mode": "original_synced_fallback", "aligned_to_video": False,
-                        "reason": (correction or {}).get("reason") or "full_asr_unavailable",
-                    }
-                    if sampled_eligible:
-                        aligned, sampled_correction, sampled_attempts = calibrate_synced_lyrics(
-                            url, matched_lyrics, candidate_duration, bilibili_duration, candidate_language_hint
-                        )
-                        recognition_attempts.extend(sampled_attempts)
-                        fallback_correction = sampled_correction
-                        fallback_correction["fallback"] = True
-                        if sampled_correction.get("aligned_to_video"):
-                            fallback_lyrics = aligned
-                    fallback_meta["correction"] = fallback_correction
-                    fallback_score = synced_fallback_quality(fallback_meta, provider_name)
-                    previous_score = synced_fallback_quality(synced_fallback[1], synced_fallback[2]) if synced_fallback else None
-                    if synced_fallback is None or fallback_score > previous_score:
-                        synced_fallback = (fallback_lyrics, fallback_meta, provider_name)
-                    continue
-                lyrics = matched_lyrics
-                lyrics_meta = matched_meta
-                lyrics_source = provider_name
-                break
-            except Exception as exc:
-                warning = warning or f"{provider_name}_lyrics_failed: {exc.__class__.__name__}"
-        if not lyrics and synced_fallback:
-            lyrics, lyrics_meta, lyrics_source = synced_fallback
+    candidates = []
+    attempted_providers = []
+    rejected_candidates = []
+    provider_artist = None if song_metadata.get("is_cover") else (song_metadata.get("artist") or artist)
+    if platform_anchors:
+        candidates.append(("bilibili_subtitle", platform_anchors, {
+            "provider": "bilibili_subtitle", "trackName": song_metadata.get("song_title"),
+            "artistName": song_metadata.get("artist"), "duration": bilibili_duration,
+            "score": 1.0, "mode": "synced_lrc",
+        }))
+    for provider_name, provider in (("netease", fetch_lyrics_from_netease), ("lrclib", fetch_lyrics_from_lrclib)):
+        attempted_providers.append(provider_name)
+        try:
+            candidate_lyrics, candidate_meta = provider(
+                song_metadata.get("song_title") or title, provider_artist, bilibili_duration
+            )
+            if candidate_lyrics:
+                candidate_meta = dict(candidate_meta or {})
+                candidate_meta.setdefault("provider", provider_name)
+                candidate_meta.setdefault("mode", "synced_lrc" if provider_name == "netease" else candidate_meta.get("mode"))
+                candidates.append((provider_name, candidate_lyrics, candidate_meta))
+        except Exception as exc:
+            warning = warning or f"{provider_name}_lyrics_failed: {exc.__class__.__name__}"
+    known_lyrics = get_known_lyrics(song_metadata.get("song_title") or title)
+    if known_lyrics:
+        candidates.append(("known_lyrics", known_lyrics, {
+            "provider": "known_lyrics", "trackName": song_metadata.get("song_title"),
+            "artistName": song_metadata.get("artist"), "score": 0.8, "mode": "text_only",
+        }))
+    attempted_providers = (["bilibili_subtitle"] if platform_anchors else []) + attempted_providers + (["known_lyrics"] if known_lyrics else [])
 
-    if not lyrics:
-        known_lyrics = get_known_lyrics(title)
-        if known_lyrics:
-            known_language_hint = infer_lyrics_language_hint(known_lyrics)
-            if not platform_anchors and (not speech_attempted or speech_language_hint != known_language_hint):
-                speech_anchors, speech_meta, speech_attempts = transcribe_audio_anchors(url, known_language_hint)
-                speech_attempted = True
-                speech_language_hint = known_language_hint
-                recognition_attempts.extend(speech_attempts)
-            anchor_lines = platform_anchors or speech_anchors
-            if anchor_lines:
-                known_lyrics, correction = align_candidate_lyrics(known_lyrics, anchor_lines, platform_anchors, speech_meta)
-                lyrics_meta = {"provider": "known_lyrics", "correction": correction}
-            lyrics = known_lyrics
-            lyrics_source = "known_lyrics"
+    language_hint = song_metadata.get("language")
+    if language_hint == "auto":
+        language_hint = None
+    if candidates or bool((LYRICS_CONFIG.get("fallback") or {}).get("allow_whisper_text", True)):
+        speech_anchors, speech_meta, speech_attempts = transcribe_audio_anchors(url, language_hint)
+        speech_attempted = True
+        speech_language_hint = language_hint
+        recognition_attempts.extend(speech_attempts)
+
+    evaluated = []
+    fallbacks = []
+    for provider_name, candidate_lyrics, candidate_meta in candidates:
+        correction = None
+        output_lyrics = candidate_lyrics
+        if speech_anchors:
+            output_lyrics, correction = align_candidate_lyrics(candidate_lyrics, speech_anchors, None, speech_meta)
+        cover_allowed = cover_candidate_has_strong_audio(song_metadata, candidate_meta, correction)
+        if correction and correction.get("aligned_to_video") and cover_allowed:
+            score = candidate_total_score(provider_name, candidate_meta, correction)
+            evaluated.append((score, provider_name, output_lyrics, candidate_meta, correction))
+            continue
+        reason = "weak_cover_audio_evidence" if not cover_allowed else ((correction or {}).get("reason") or "missing_audio_evidence")
+        rejected_candidates.append({
+            "provider": provider_name, "trackName": candidate_meta.get("trackName"),
+            "artistName": candidate_meta.get("artistName"), "reason": reason,
+        })
+        if not cover_allowed:
+            continue
+        text_only = candidate_meta.get("mode") == "text_only"
+        if text_only:
+            continue
+        lyric_times = [float(line.get("seconds") or 0) for line in candidate_lyrics]
+        lyric_span = max(lyric_times) - min(lyric_times) if lyric_times else 0
+        fallback_lyrics = candidate_lyrics
+        fallback_correction = {"mode": "original_synced_fallback", "aligned_to_video": False, "reason": reason, "fallback": True}
+        if bilibili_duration >= 60 and len(candidate_lyrics) >= 8 and lyric_span >= 45:
+            aligned, sampled_correction, sampled_attempts = calibrate_synced_lyrics(
+                url, candidate_lyrics, float(candidate_meta.get("duration") or 0), bilibili_duration, infer_lyrics_language_hint(candidate_lyrics)
+            )
+            recognition_attempts.extend(sampled_attempts)
+            fallback_correction = dict(sampled_correction or fallback_correction)
+            fallback_correction["fallback"] = True
+            if fallback_correction.get("aligned_to_video"):
+                fallback_lyrics = aligned
+        fallback_meta = {**candidate_meta, "correction": fallback_correction}
+        fallbacks.append((synced_fallback_quality(fallback_meta, provider_name), provider_name, fallback_lyrics, candidate_meta, fallback_correction))
+
+    if evaluated:
+        _, lyrics_source, lyrics, selected_meta, selected_correction = max(evaluated, key=lambda item: item[0])
+        lyrics_meta = standardized_lyrics_meta(lyrics_source, selected_meta, selected_correction, song_metadata, attempted_providers, rejected_candidates)
+    elif fallbacks and bool((LYRICS_CONFIG.get("fallback") or {}).get("allow_original_synced", True)):
+        _, lyrics_source, lyrics, selected_meta, selected_correction = max(fallbacks, key=lambda item: item[0])
+        lyrics_meta = standardized_lyrics_meta(lyrics_source, selected_meta, selected_correction, song_metadata, attempted_providers, rejected_candidates, "lrc_timeline_synced")
 
     if not lyrics:
         if not speech_attempted:
             speech_anchors, speech_meta, speech_attempts = transcribe_audio_anchors(url)
             speech_attempted = True
             recognition_attempts.extend(speech_attempts)
+        if speech_anchors and bool((LYRICS_CONFIG.get("fallback") or {}).get("allow_whisper_text", True)):
+            lyrics = whisper_fallback_lines(speech_anchors)
+            if lyrics:
+                lyrics_source = "whisper"
+                whisper_correction = {
+                    "mode": "recognized_segment_timeline",
+                    "aligned_to_video": True,
+                    "matched_count": len(lyrics),
+                }
+                lyrics_meta = standardized_lyrics_meta(
+                    "whisper",
+                    {"provider": "whisper", "mode": "text_only"},
+                    whisper_correction,
+                    song_metadata,
+                    attempted_providers + ["whisper"],
+                    rejected_candidates,
+                    "none",
+                )
+
+    if not lyrics:
         video_lyrics, video_meta, video_attempts = attempt_video_recognition(url)
         recognition_attempts.extend(video_attempts)
         if video_lyrics:
             lyrics = video_lyrics
-            lyrics_meta = video_meta
             lyrics_source = "video_recognition"
+            video_correction = (video_meta or {}).get("correction") or video_meta or {}
+            lyrics_meta = standardized_lyrics_meta(
+                "video_recognition", video_meta, video_correction, song_metadata,
+                attempted_providers + ["video_recognition"], rejected_candidates,
+            )
 
     if not lyrics:
         if platform_anchors:
@@ -1886,13 +2106,15 @@ def identify(url):
 
 
 def cached_video_path(url):
-    bvid = extract_bvid(url)
-    key = bvid or hashlib.sha1((url or "").encode("utf-8")).hexdigest()[:16]
+    key = media_cache_key(url)
     return VIDEO_CACHE_DIR / f"{key}.mp4"
 
 
 def media_cache_key(url):
-    return extract_bvid(url) or hashlib.sha1((url or "").encode("utf-8")).hexdigest()[:16]
+    bvid = extract_bvid(url)
+    if bvid:
+        return f"{bvid}-p{extract_page_number(url)}"
+    return hashlib.sha1((url or "").encode("utf-8")).hexdigest()[:16]
 
 
 def cached_audio_path(url):
@@ -2307,7 +2529,10 @@ def load_cached_sampled_speech(url, windows, language_hint=None):
         return None
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
-        version_ok = payload.get("version") == SAMPLED_SPEECH_CACHE_SCHEMA_VERSION
+        version_ok = (
+            payload.get("version") == SAMPLED_SPEECH_CACHE_SCHEMA_VERSION
+            and payload.get("pipelineVersion") == LYRICS_PIPELINE_VERSION
+        )
         windows_ok = payload.get("windows") == expected
         segments_ok = cached_segments_are_valid(payload.get("segments"), require_quality=True)
         meta = payload.get("meta") or {}
@@ -2330,6 +2555,7 @@ def save_cached_sampled_speech(url, windows, segments, meta):
     temp_path = unique_temp_path(path, "sampled-speech")
     payload = {
         "version": SAMPLED_SPEECH_CACHE_SCHEMA_VERSION,
+        "pipelineVersion": LYRICS_PIPELINE_VERSION,
         "windows": [[round(float(item["start"]), 3), round(float(item["end"]), 3)] for item in windows],
         "segments": segments,
         "meta": meta,
@@ -2350,7 +2576,10 @@ def load_cached_speech(url, language_hint=None):
         meta = payload.get("meta") or {}
         current_model = normalized_model_identity(resolve_whisper_model())
         cached_model = normalized_model_identity(meta.get("model"))
-        version_ok = payload.get("version") == SPEECH_CACHE_SCHEMA_VERSION
+        version_ok = (
+            payload.get("version") == SPEECH_CACHE_SCHEMA_VERSION
+            and payload.get("pipelineVersion") == LYRICS_PIPELINE_VERSION
+        )
         segments_ok = cached_segments_are_valid(segments, require_words=True, require_quality=True)
         model_ok = bool(cached_model) and cached_model == current_model
         cached_language = normalized_language_hint(meta.get("languageHint") or meta.get("requestedLanguage"))
@@ -2442,7 +2671,12 @@ def _transcribe_audio_anchors(url, language_hint=None):
             "duration": getattr(info, "duration", None),
         }
         if normalized_segments:
-            save_cached_speech(url, {"version": SPEECH_CACHE_SCHEMA_VERSION, "segments": normalized_segments, "meta": meta})
+            save_cached_speech(url, {
+                "version": SPEECH_CACHE_SCHEMA_VERSION,
+                "pipelineVersion": LYRICS_PIPELINE_VERSION,
+                "segments": normalized_segments,
+                "meta": meta,
+            })
         return normalized_segments, meta, [{
             "stage": "speech_anchors",
             "status": "ok" if normalized_segments else "no_result",
