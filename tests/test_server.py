@@ -652,6 +652,42 @@ class HttpConfigurationTests(unittest.TestCase):
             "/api/video?url=https%3A%2F%2Fwww.bilibili.com%2Fvideo%2FBV1TEST",
         )
 
+    def test_bilibili_media_url_allows_only_official_media_hosts(self):
+        self.assertTrue(server._is_allowed_bilibili_media_url("https://upos.example.bilivideo.com/video.m4s"))
+        self.assertTrue(server._is_allowed_bilibili_media_url("https://upos.example.bilivideo.cn/audio.m4s"))
+        for value in (
+            "https://example.com/video.m4s",
+            "https://bilivideo.com.evil.example/video.m4s",
+            "https://user:pass@upos.example.bilivideo.com/video.m4s",
+            "https://upos.example.bilivideo.com:444/video.m4s",
+            "file:///tmp/video.m4s",
+        ):
+            with self.subTest(value=value):
+                self.assertFalse(server._is_allowed_bilibili_media_url(value))
+
+    def test_fetch_bilibili_media_streams_prefers_h264_and_highest_audio_bandwidth(self):
+        view_payload = {"code": 0, "data": {"cid": 123}}
+        play_payload = {
+            "code": 0,
+            "data": {
+                "dash": {
+                    "video": [
+                        {"baseUrl": "https://v1.bilivideo.com/video.m4s", "codecs": "hev1", "bandwidth": 900},
+                        {"baseUrl": "https://v2.bilivideo.com/video.m4s", "codecs": "avc1.64001F", "bandwidth": 500},
+                    ],
+                    "audio": [
+                        {"baseUrl": "https://a1.bilivideo.com/audio.m4s", "bandwidth": 100},
+                        {"baseUrl": "https://a2.bilivideo.com/audio.m4s", "bandwidth": 200},
+                    ],
+                }
+            },
+        }
+        with patch.object(server, "fetch_video_view", return_value=view_payload["data"]), \
+             patch.object(server, "request_json", return_value=play_payload):
+            streams = server.fetch_bilibili_media_streams("https://www.bilibili.com/video/BV1TEST")
+        self.assertEqual(streams["video_url"], "https://v2.bilivideo.com/video.m4s")
+        self.assertEqual(streams["audio_url"], "https://a2.bilivideo.com/audio.m4s")
+
     def test_request_body_limits(self):
         self.assertEqual(server.MAX_JSON_BODY_BYTES, 1024 * 1024)
         self.assertEqual(server.MAX_LYRICS_BYTES, 512 * 1024)

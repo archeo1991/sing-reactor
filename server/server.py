@@ -1,6 +1,5 @@
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, quote, urljoin, urlparse
-from urllib.parse import urlencode
+from urllib.parse import parse_qs, quote, urlencode, urljoin, urlparse
 from urllib.request import Request, urlopen
 from difflib import SequenceMatcher
 from statistics import median
@@ -173,6 +172,55 @@ def request_json(url, referer="https://www.bilibili.com/"):
     )
     with urlopen(request, timeout=8) as response:
         return json.loads(response.read().decode("utf-8", errors="ignore"))
+
+
+BILIBILI_REQUEST_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36",
+    "Referer": "https://www.bilibili.com/",
+}
+
+
+def _is_allowed_bilibili_media_url(value):
+    try:
+        parsed = urlparse(value)
+    except ValueError:
+        return False
+    host = (parsed.hostname or "").lower().rstrip(".")
+    if parsed.scheme not in {"http", "https"} or parsed.username or parsed.password:
+        return False
+    try:
+        port = parsed.port
+    except ValueError:
+        return False
+    if port not in (None, 80 if parsed.scheme == "http" else 443):
+        return False
+    return host == "bilivideo.com" or host.endswith(".bilivideo.com") or host == "bilivideo.cn" or host.endswith(".bilivideo.cn")
+
+
+def fetch_bilibili_media_streams(url):
+    bvid = extract_bvid(url)
+    if not bvid:
+        return None
+    view = fetch_video_view(bvid)
+    if not view or not view.get("cid"):
+        return None
+    query = urlencode({"bvid": bvid, "cid": view["cid"], "fnval": 16, "qn": 80, "fourk": 1})
+    payload = request_json(f"https://api.bilibili.com/x/player/playurl?{query}")
+    if payload.get("code") != 0:
+        return None
+    data = payload.get("data") or {}
+    dash = data.get("dash") or {}
+    videos = [item for item in dash.get("video") or [] if _is_allowed_bilibili_media_url(item.get("baseUrl") or item.get("base_url"))]
+    audios = [item for item in dash.get("audio") or [] if _is_allowed_bilibili_media_url(item.get("baseUrl") or item.get("base_url"))]
+    if not videos or not audios:
+        return None
+    video = max(videos, key=lambda item: ("avc1" in str(item.get("codecs") or ""), int(item.get("bandwidth") or 0)))
+    audio = max(audios, key=lambda item: int(item.get("bandwidth") or 0))
+    return {
+        "video_url": video.get("baseUrl") or video.get("base_url"),
+        "audio_url": audio.get("baseUrl") or audio.get("base_url"),
+        "headers": BILIBILI_REQUEST_HEADERS,
+    }
 
 
 def post_json(url, data, referer):
@@ -2497,42 +2545,69 @@ def _ensure_cached_video(url):
             return target
     yt_dlp_command = get_yt_dlp_command()
     ffmpeg_path = get_ffmpeg_path()
-    if not yt_dlp_command or not ffmpeg_path:
+    if not ffmpeg_path:
         raise RuntimeError("missing_video_tools")
     download_base = unique_temp_path(target, "download")
-    output = str(download_base.with_suffix(".%(ext)s"))
-    command = yt_dlp_command + [
-        "-f",
-        "bestvideo[vcodec^=avc1][ext=mp4]+bestaudio[ext=m4a]/bestvideo[vcodec^=avc1]+bestaudio/best[ext=mp4]/best",
-        "--merge-output-format",
-        "mp4",
-        "--ffmpeg-location",
-        str(ffmpeg_path),
-        "-o",
-        output,
-        url,
-    ]
-    completed = subprocess.run(
-        command,
-        cwd=VIDEO_CACHE_DIR,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="ignore",
-        timeout=300,
-        env=subprocess_env(),
-    )
-    candidates = [target] + sorted(VIDEO_CACHE_DIR.glob(f"{download_base.stem}*.mp4"), key=lambda item: item.stat().st_mtime, reverse=True)
-    for candidate in candidates:
-        if candidate.exists() and candidate.stat().st_size > 1024 * 64 and video_has_audio(candidate) and video_is_browser_compatible(candidate):
-            if candidate != target:
-                candidate.replace(target)
-            return target
-    for candidate in candidates:
-        if candidate.exists() and candidate.stat().st_size > 1024 * 64 and video_has_audio(candidate):
-            if candidate != target:
-                candidate.replace(target)
-            if transcode_to_browser_mp4(target):
+    if yt_dlp_command:
+        output = str(download_base.with_suffix(".%(ext)s"))
+        command = yt_dlp_command + [
+            "-f",
+            "bestvideo[vcodec^=avc1][ext=mp4]+bestaudio[ext=m4a]/bestvideo[vcodec^=avc1]+bestaudio/best[ext=mp4]/best",
+            "--merge-output-format",
+            "mp4",
+            "--ffmpeg-location",
+            str(ffmpeg_path),
+            "-o",
+            output,
+            url,
+        ]
+        subprocess.run(
+            command,
+            cwd=VIDEO_CACHE_DIR,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="ignore",
+            timeout=300,
+            env=subprocess_env(),
+        )
+        candidates = [target] + sorted(VIDEO_CACHE_DIR.glob(f"{download_base.stem}*.mp4"), key=lambda item: item.stat().st_mtime, reverse=True)
+        for candidate in candidates:
+            if candidate.exists() and candidate.stat().st_size > 1024 * 64 and video_has_audio(candidate) and video_is_browser_compatible(candidate):
+                if candidate != target:
+                    candidate.replace(target)
+                return target
+        for candidate in candidates:
+            if candidate.exists() and candidate.stat().st_size > 1024 * 64 and video_has_audio(candidate):
+                if candidate != target:
+                    candidate.replace(target)
+                if transcode_to_browser_mp4(target):
+                    return target
+
+    # Bilibili may return HTTP 412 to yt-dlp's webpage extractor from cloud IPs.
+    # The official playurl API avoids the webpage gate while keeping media hosts validated.
+    streams = fetch_bilibili_media_streams(url)
+    if streams:
+        output_path = download_base.with_suffix(".api.mp4")
+        headers = "".join(f"{key}: {value}\r\n" for key, value in streams["headers"].items())
+        completed = subprocess.run(
+            [
+                ffmpeg_path, "-y", "-headers", headers, "-i", streams["video_url"],
+                "-headers", headers, "-i", streams["audio_url"],
+                "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-c:a", "aac",
+                "-shortest", "-movflags", "+faststart", str(output_path),
+            ],
+            cwd=VIDEO_CACHE_DIR,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="ignore",
+            timeout=300,
+            env=subprocess_env(),
+        )
+        if completed.returncode == 0 and output_path.exists() and output_path.stat().st_size > 1024 * 64:
+            output_path.replace(target)
+            if video_has_audio(target) and video_is_browser_compatible(target):
                 return target
     raise RuntimeError("video_download_failed")
 
@@ -2684,7 +2759,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_video_file(path)
             except UnsafeUrlError:
                 self._send_json({"ok": False, "error": "unsupported_url"}, 400)
-            except Exception:
+            except Exception as exc:
+                sys.stderr.write(f"[server] video unavailable: {exc.__class__.__name__}: {exc}\n")
                 self._send_json({"ok": False, "error": "video_unavailable"}, 502)
             return
         self._send_json({"ok": False, "error": "not_found"}, 404)
