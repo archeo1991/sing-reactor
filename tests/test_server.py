@@ -135,6 +135,9 @@ class LyricsPipelineMetadataTests(unittest.TestCase):
             server.lyric_line(0, "演唱 : 黄霄雲"),
             server.lyric_line(3, "原唱 : 青鸟飞鱼"),
             server.lyric_line(6, "音乐总监 : 谷粟"),
+            server.lyric_line(7, "乐队统筹 : 陈嘉雯"),
+            server.lyric_line(8, "打击乐 : 郑瑀"),
+            server.lyric_line(8.5, "和音 : 王梓琼"),
             server.lyric_line(9, "这是正式歌词"),
         ]
         self.assertEqual([line["text"] for line in server.clean_lyric_lines(lines)], ["这是正式歌词"])
