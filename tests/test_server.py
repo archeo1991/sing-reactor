@@ -343,6 +343,28 @@ class IdentifyTests(unittest.TestCase):
         self.assertEqual(payload["lyricsSource"], "whisper")
         self.assertEqual(payload["lyricsMeta"]["rejectedCandidates"][0]["reason"], "version_timeline_unverified")
 
+    def test_live_lrc_keeps_online_text_when_weak_offset_is_available(self):
+        candidate = [server.lyric_line(index * 20, f"在线歌词第{index}句") for index in range(10)]
+        aligned = [server.lyric_line(index * 20 + 2, line["text"]) for index, line in enumerate(candidate)]
+        anchors = [{"start": 40.0, "end": 43.0, "text": "在线歌词第二句"}]
+        view = {"title": "歌手《示例歌》Live 演唱会", "cid": 123, "duration": 180}
+        weak_fit = {"mode": "sampled_fixed_offset", "aligned_to_video": True, "offset": 2.0, "scale": 1.0, "avg_similarity": 0.895, "matched_count": 1, "window_count": 1, "weak_evidence": True}
+        with patch.object(server, "normalize_bilibili_url", return_value="https://www.bilibili.com/video/BV1TEST"), \
+             patch.object(server, "fetch_video_view", return_value=view), \
+             patch.object(server, "fetch_subtitle_lines", return_value=[]), \
+             patch.object(server, "fetch_lyrics_from_netease", return_value=(candidate, {"trackName": "示例歌 (live)", "artistName": "歌手", "duration": 180})), \
+             patch.object(server, "fetch_lyrics_from_lrclib", return_value=([], None)), \
+             patch.object(server, "align_candidate_lyrics", return_value=(candidate, {"mode": "unverified", "aligned_to_video": False, "reason": "insufficient_line_coverage"})), \
+             patch.object(server, "transcribe_audio_anchors", return_value=(anchors, {"provider": "faster_whisper"}, [])), \
+             patch.object(server, "calibrate_synced_lyrics", return_value=(aligned, weak_fit, [])), \
+             patch.object(server, "get_safe_video_stream_url", return_value=None), \
+             patch.object(server, "cached_video_path", return_value=ROOT / ".missing-test-video"):
+            payload, status = server.identify("https://www.bilibili.com/video/BV1TEST")
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["lyricsSource"], "netease")
+        self.assertEqual(payload["lyrics"], aligned)
+        self.assertTrue(payload["lyricsMeta"]["correction"].get("weak_evidence"))
+
     def test_recognition_attempts_accumulate_across_fallbacks(self):
         speech_attempt = {"stage": "speech_anchors", "status": "no_result"}
         video_attempt = {"stage": "video_subtitle", "status": "no_result"}

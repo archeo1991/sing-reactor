@@ -19,6 +19,9 @@
   },
   "fallback": {
     "allow_original_synced": true,
-    "allow_whisper_text": true
+    "allow_whisper_text": true,
+    "allow_weak_timeline_rebuild": true,
+    "weak_timeline_min_similarity": 0.86,
+    "weak_timeline_max_offset": 45
   }
 }

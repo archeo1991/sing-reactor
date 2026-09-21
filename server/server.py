@@ -68,7 +68,11 @@ def load_lyrics_config():
             "schema_version": 1, "pipeline_version": 2,
             "provider_quality": {"bilibili_subtitle": 0.72, "netease": 0.85, "lrclib": 0.9},
             "candidate_selection": {"metadata_weight": 0.14, "provider_weight": 0.06, "audio_weight": 0.8},
-            "fallback": {"allow_original_synced": True, "allow_whisper_text": True},
+            "fallback": {
+                "allow_original_synced": True, "allow_whisper_text": True,
+                "allow_weak_timeline_rebuild": True,
+                "weak_timeline_min_similarity": 0.86, "weak_timeline_max_offset": 45,
+            },
         }
 
 
@@ -2794,6 +2798,34 @@ def calibrate_synced_lyrics(url, lyrics, candidate_duration, media_duration, lan
     fit["anchorProvider"] = (speech_meta or {}).get("provider")
     fit["attempts"] = attempts
     if fit.get("mode") not in ("sampled_fixed_offset", "sampled_linear_timeline"):
+        fallback_config = LYRICS_CONFIG.get("fallback") or {}
+        matches = list(fit.get("matches") or [])
+        fixed_model = fit.get("fixed_model") or {}
+        strong_matches = [
+            item for item in matches
+            if float(item.get("similarity") or 0) >= float(fallback_config.get("weak_timeline_min_similarity", 0.86))
+        ]
+        weak_offset = fixed_model.get("offset")
+        if (
+            bool(fallback_config.get("allow_weak_timeline_rebuild", True))
+            and strong_matches
+            and weak_offset is not None
+            and abs(float(weak_offset)) <= float(fallback_config.get("weak_timeline_max_offset", 45))
+        ):
+            fit = {
+                **fit,
+                "mode": "sampled_fixed_offset",
+                "scale": 1.0,
+                "offset": float(weak_offset),
+                "matched_count": len(strong_matches),
+                "window_count": len({int(item.get("window_index", 0)) for item in strong_matches}),
+                "avg_similarity": sum(float(item.get("similarity") or 0) for item in strong_matches) / len(strong_matches),
+                "confidence_basis": "weak_audio_anchor",
+                "weak_evidence": True,
+            }
+            fit["aligned_to_video"] = True
+            transformed = apply_timeline_transform(lyrics, 1.0, float(weak_offset))
+            return transformed, fit, attempts
         fit["aligned_to_video"] = False
         return lyrics, fit, attempts
     fit["aligned_to_video"] = True
