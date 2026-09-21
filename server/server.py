@@ -507,7 +507,15 @@ def lyrics_duration(lines):
 
 def is_credit_lyric_line(text):
     text = str(text or "").strip()
-    return bool(re.match(r"^(作词|作詞|作曲|编曲|編曲|制作人|監製|监制|录音|錄音|混音|母带|和声|和聲|吉他|贝斯|貝斯|鼓|弦乐|弦樂|键盘|鍵盤|OP|SP|出品|发行|發行)\s*[:：]", text, re.I))
+    role = (
+        r"演唱|原唱|作词|作詞|作曲|编曲|編曲|改编|改編|改编编曲|改編編曲|"
+        r"制作人|制作|製作人|製作|監製|监制|音乐总监|音樂總監|音响总监|音響總監|"
+        r"舞台总监|舞台總監|音乐设计|音樂設計|音乐统筹|音樂統籌|乐队总监|樂隊總監|"
+        r"录音|錄音|混音|母带|母帶|和声|和聲|和声编写|和聲編寫|声乐指导|聲樂指導|"
+        r"吉他|贝斯|貝斯|鼓|鼓手|弦乐|弦樂|键盘|鍵盤|钢琴|鋼琴|PGM|Program|"
+        r"OP|SP|出品|发行|發行|版权|版權"
+    )
+    return bool(re.match(rf"^(?:{role})\s*[:：]", text, re.I))
 
 
 def clean_lyric_lines(lines):
@@ -1778,6 +1786,20 @@ def cover_candidate_has_strong_audio(song_metadata, meta, correction):
     )
 
 
+def candidate_requires_verified_timeline(song_metadata, meta):
+    version_text = " ".join(str(value or "") for value in (
+        song_metadata.get("version"),
+        (meta or {}).get("trackName"),
+        (meta or {}).get("version"),
+    ))
+    return bool(
+        song_metadata.get("is_live")
+        or song_metadata.get("is_cover")
+        or song_metadata.get("is_instrumental")
+        or re.search(r"\blive\b|\bcover\b|\bremix\b|现场|現場|演唱会|演唱會|翻唱|伴奏|剪辑|剪輯|变速|變速", version_text, re.I)
+    )
+
+
 def standardized_lyrics_meta(provider, meta, correction, song_metadata, attempted_providers, rejected_candidates, mode=None):
     correction = dict(correction or {})
     internal_mode = str(correction.get("mode") or "")
@@ -2004,6 +2026,9 @@ def identify(url):
             fallback_correction["fallback"] = True
             if fallback_correction.get("aligned_to_video"):
                 fallback_lyrics = aligned
+        if candidate_requires_verified_timeline(song_metadata, candidate_meta) and not fallback_correction.get("aligned_to_video"):
+            rejected_candidates[-1]["reason"] = "version_timeline_unverified"
+            continue
         fallback_meta = {**candidate_meta, "correction": fallback_correction}
         fallbacks.append((synced_fallback_quality(fallback_meta, provider_name), provider_name, fallback_lyrics, candidate_meta, fallback_correction))
 
