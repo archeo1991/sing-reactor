@@ -2806,10 +2806,13 @@ def calibrate_synced_lyrics(url, lyrics, candidate_duration, media_duration, lan
             if float(item.get("similarity") or 0) >= float(fallback_config.get("weak_timeline_min_similarity", 0.86))
         ]
         weak_offset = fixed_model.get("offset")
+        duration_delta = abs(float(candidate_duration or 0) - float(media_duration or 0))
+        version_mismatch = duration_delta > 8.0
         if (
             bool(fallback_config.get("allow_weak_timeline_rebuild", True))
             and strong_matches
             and weak_offset is not None
+            and version_mismatch
             and abs(float(weak_offset)) <= float(fallback_config.get("weak_timeline_max_offset", 45))
         ):
             fit = {

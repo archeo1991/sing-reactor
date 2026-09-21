@@ -328,7 +328,7 @@ class IdentifyTests(unittest.TestCase):
     def test_unverified_live_lrc_falls_back_to_whisper(self):
         candidate = self.synced_lyrics()
         anchors = [{"start": 27.0, "end": 30.0, "text": "现场识别歌词"}]
-        view = {"title": "歌手《示例歌》Live 演唱会", "cid": 123, "duration": 180}
+        view = {"title": "歌手《示例歌》Live 演唱会", "cid": 123, "duration": 200}
         rejected = {"mode": "unverified", "aligned_to_video": False, "reason": "insufficient_line_coverage"}
         sampled_rejected = {"mode": "unverified", "aligned_to_video": False, "reason": "low_confidence"}
         with patch.object(server, "normalize_bilibili_url", return_value="https://www.bilibili.com/video/BV1TEST"), \
@@ -350,7 +350,7 @@ class IdentifyTests(unittest.TestCase):
         candidate = [server.lyric_line(index * 20, f"在线歌词第{index}句") for index in range(10)]
         aligned = [server.lyric_line(index * 20 + 2, line["text"]) for index, line in enumerate(candidate)]
         anchors = [{"start": 40.0, "end": 43.0, "text": "在线歌词第二句"}]
-        view = {"title": "歌手《示例歌》Live 演唱会", "cid": 123, "duration": 180}
+        view = {"title": "歌手《示例歌》Live 演唱会", "cid": 123, "duration": 200}
         weak_fit = {"mode": "sampled_fixed_offset", "aligned_to_video": True, "offset": 2.0, "scale": 1.0, "avg_similarity": 0.895, "matched_count": 1, "window_count": 1, "weak_evidence": True}
         with patch.object(server, "normalize_bilibili_url", return_value="https://www.bilibili.com/video/BV1TEST"), \
              patch.object(server, "fetch_video_view", return_value=view), \
