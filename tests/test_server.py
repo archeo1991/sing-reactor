@@ -673,11 +673,20 @@ class HttpConfigurationTests(unittest.TestCase):
                 "dash": {
                     "video": [
                         {"baseUrl": "https://v1.bilivideo.com/video.m4s", "codecs": "hev1", "bandwidth": 900},
-                        {"baseUrl": "https://v2.bilivideo.com/video.m4s", "codecs": "avc1.64001F", "bandwidth": 500},
+                        {
+                            "baseUrl": "https://third-party.example/video.m4s",
+                            "backupUrl": ["https://v2.bilivideo.com/video.m4s"],
+                            "codecs": "avc1.64001F",
+                            "bandwidth": 500,
+                        },
                     ],
                     "audio": [
                         {"baseUrl": "https://a1.bilivideo.com/audio.m4s", "bandwidth": 100},
-                        {"baseUrl": "https://a2.bilivideo.com/audio.m4s", "bandwidth": 200},
+                        {
+                            "baseUrl": "https://third-party.example/audio.m4s",
+                            "backup_url": ["https://a2.bilivideo.com/audio.m4s"],
+                            "bandwidth": 200,
+                        },
                     ],
                 }
             },

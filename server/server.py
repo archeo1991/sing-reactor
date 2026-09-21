@@ -197,6 +197,12 @@ def _is_allowed_bilibili_media_url(value):
     return host == "bilivideo.com" or host.endswith(".bilivideo.com") or host == "bilivideo.cn" or host.endswith(".bilivideo.cn")
 
 
+def _safe_bilibili_media_urls(item):
+    values = [item.get("baseUrl") or item.get("base_url")]
+    values.extend(item.get("backupUrl") or item.get("backup_url") or [])
+    return [value for value in values if value and _is_allowed_bilibili_media_url(value)]
+
+
 def fetch_bilibili_media_streams(url):
     bvid = extract_bvid(url)
     if not bvid:
@@ -210,15 +216,17 @@ def fetch_bilibili_media_streams(url):
         return None
     data = payload.get("data") or {}
     dash = data.get("dash") or {}
-    videos = [item for item in dash.get("video") or [] if _is_allowed_bilibili_media_url(item.get("baseUrl") or item.get("base_url"))]
-    audios = [item for item in dash.get("audio") or [] if _is_allowed_bilibili_media_url(item.get("baseUrl") or item.get("base_url"))]
+    videos = [(item, _safe_bilibili_media_urls(item)) for item in dash.get("video") or []]
+    audios = [(item, _safe_bilibili_media_urls(item)) for item in dash.get("audio") or []]
+    videos = [(item, urls) for item, urls in videos if urls]
+    audios = [(item, urls) for item, urls in audios if urls]
     if not videos or not audios:
         return None
-    video = max(videos, key=lambda item: ("avc1" in str(item.get("codecs") or ""), int(item.get("bandwidth") or 0)))
-    audio = max(audios, key=lambda item: int(item.get("bandwidth") or 0))
+    video, video_urls = max(videos, key=lambda pair: ("avc1" in str(pair[0].get("codecs") or ""), int(pair[0].get("bandwidth") or 0)))
+    audio, audio_urls = max(audios, key=lambda pair: int(pair[0].get("bandwidth") or 0))
     return {
-        "video_url": video.get("baseUrl") or video.get("base_url"),
-        "audio_url": audio.get("baseUrl") or audio.get("base_url"),
+        "video_url": video_urls[0],
+        "audio_url": audio_urls[0],
         "headers": BILIBILI_REQUEST_HEADERS,
     }
 
