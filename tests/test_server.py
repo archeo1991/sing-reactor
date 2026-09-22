@@ -46,6 +46,64 @@ class UrlSafetyTests(unittest.TestCase):
                     http_safety.validate_bilibili_url(value, resolve_host=False)
 
 
+class WebLyricsTests(unittest.TestCase):
+    def test_extracts_preferred_html_and_filters_page_noise(self):
+        page = """
+        <html><body>
+          <nav>返回首页</nav><div>歌曲介绍和无关正文</div>
+          <section class="song-lyrics">
+            <p>作词：某人</p><p>第一句歌词</p><p>第二句歌词</p><p>第三句歌词</p>
+            <p>相关推荐</p>
+          </section>
+          <footer>隐私政策</footer>
+        </body></html>
+        """
+        self.assertEqual(
+            [line["text"] for line in server.extract_web_lyrics_text(page)],
+            ["第一句歌词", "第二句歌词", "第三句歌词"],
+        )
+
+    def test_extracts_json_ld_lyrics_but_rejects_short_description(self):
+        page = """
+        <script type="application/ld+json">
+          {"description":"普通页面简介", "lyrics":"第一句歌词\\n第二句歌词\\n第三句歌词"}
+        </script>
+        """
+        self.assertEqual(
+            [line["text"] for line in server.extract_web_lyrics_text(page)],
+            ["第一句歌词", "第二句歌词", "第三句歌词"],
+        )
+        short = '<script type="application/ld+json">{"description":"只有一行简介"}</script>'
+        self.assertEqual(server.extract_web_lyrics_text(short), [])
+
+    def test_extracts_timed_lrc_from_page(self):
+        page = '<pre id="lrc">[00:03.50]第一句歌词\n[00:09.25]第二句歌词\n[00:15.00]第三句歌词</pre>'
+        lines = server.extract_web_lyrics_text(page)
+        self.assertEqual([line["text"] for line in lines], ["第一句歌词", "第二句歌词", "第三句歌词"])
+        self.assertEqual([line["seconds"] for line in lines], [3.5, 9.25, 15.0])
+
+    @patch("http_safety.socket.getaddrinfo")
+    def test_web_url_requires_allowed_host_and_public_dns(self, getaddrinfo):
+        getaddrinfo.return_value = [(2, 1, 6, "", ("93.184.216.34", 443))]
+        self.assertEqual(
+            server.validate_lyrics_web_url("https://lyrics.com/song"),
+            "https://lyrics.com/song",
+        )
+        with self.assertRaises(http_safety.UnsafeUrlError):
+            server.validate_lyrics_web_url("https://example.com/song")
+        getaddrinfo.return_value = [(2, 1, 6, "", ("127.0.0.1", 443))]
+        with self.assertRaises(http_safety.UnsafeUrlError):
+            server.validate_lyrics_web_url("https://lyrics.com/song")
+
+    def test_web_redirect_handler_revalidates_redirect_target(self):
+        handler = server._LyricsRedirectHandler()
+        request = server.Request("https://lyrics.com/song")
+        with patch.object(server, "validate_lyrics_web_url", side_effect=http_safety.UnsafeUrlError("host_not_allowed")) as validate:
+            with self.assertRaises(http_safety.UnsafeUrlError):
+                handler.redirect_request(request, None, 302, "Found", Message(), "http://127.0.0.1/private")
+        validate.assert_called_once_with("http://127.0.0.1/private")
+
+
 class RangeTests(unittest.TestCase):
     def test_three_supported_range_forms(self):
         self.assertEqual(http_safety.parse_single_range("bytes=2-5", 10), (2, 5))
@@ -84,6 +142,10 @@ class LyricsPipelineMetadataTests(unittest.TestCase):
         self.assertEqual((page["cid"], requested, total), (22, 2, 2))
         self.assertEqual(server.media_cache_key("https://www.bilibili.com/video/BV1TEST"), "BV1TEST-p1")
         self.assertEqual(server.media_cache_key("https://www.bilibili.com/video/BV1TEST?p=2"), "BV1TEST-p2")
+
+    def test_normalize_song_query_removes_upload_quality_suffixes(self):
+        self.assertEqual(server.normalize_song_query("此生不换 4k 上传"), "此生不换")
+        self.assertEqual(server.normalize_song_query("高清 无损 修复版 此生不换"), "此生不换")
 
     def test_metadata_keeps_version_and_language_signals(self):
         metadata = server.build_song_metadata(
@@ -130,6 +192,12 @@ class LyricsPipelineMetadataTests(unittest.TestCase):
             server.candidate_total_score("lrclib", {"score": 1.0}, weak_audio),
         )
 
+    def test_alignment_normalizes_traditional_chinese(self):
+        self.assertEqual(
+            server.normalize_alignment_text("時光穿不斷 再有一萬年"),
+            server.normalize_alignment_text("时光穿不断 再有一万年"),
+        )
+
     def test_live_credit_lines_are_removed_from_lyrics_candidates(self):
         lines = [
             server.lyric_line(0, "演唱 : 黄霄雲"),
@@ -152,6 +220,22 @@ class IdentifyTests(unittest.TestCase):
     @staticmethod
     def synced_lyrics():
         return [server.lyric_line(index * 20, f"第{index}句测试歌词内容") for index in range(10)]
+
+    def test_identify_uses_web_only_after_structured_candidates_fail_and_validates_with_whisper(self):
+        structured = self.synced_lyrics()
+        web_lines = [server.lyric_line(index * 6, f"网页第{index}句歌词") for index in range(10)]
+        rejected = {"mode": "unverified", "aligned_to_video": False, "reason": "low_text_similarity"}
+        accepted = {"mode": "asr_word_sequence_timeline", "aligned_to_video": True, "confidence": 0.9, "line_coverage": 0.8, "matched_count": 8}
+        view = {"title": "测试歌曲", "cid": 123, "duration": 180}
+        with patch.object(server, "normalize_bilibili_url", return_value="https://www.bilibili.com/video/BV1TEST"), patch.object(server, "fetch_video_view", return_value=view), patch.object(server, "fetch_subtitle_lines", return_value=[]), patch.object(server, "fetch_lyrics_from_netease", return_value=(structured, {"duration": 180, "mode": "text_only"})), patch.object(server, "fetch_lyrics_from_lrclib", return_value=([], None)), patch.object(server, "transcribe_audio_anchors", return_value=([{"text": "anchor"}], {"provider": "faster_whisper"}, [])) as whisper, patch.object(server, "align_candidate_lyrics", side_effect=[(structured, rejected), (web_lines, accepted)]) as align, patch.object(server, "search_web_lyrics_candidates", return_value=[{"lines": web_lines, "source_url": "https://lyrics.com/test"}]) as web, patch.object(server, "get_safe_video_stream_url", return_value=None), patch.object(server, "cached_video_path", return_value=ROOT / ".missing-test-video"):
+            payload, status = server.identify("https://www.bilibili.com/video/BV1TEST")
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["lyricsSource"], "web")
+        self.assertEqual(payload["lyrics"], web_lines)
+        self.assertIn("web", payload["lyricsMeta"]["attemptedProviders"])
+        web.assert_called_once_with("测试歌曲", None)
+        self.assertEqual(align.call_count, 2)
+        whisper.assert_called_once_with("https://www.bilibili.com/video/BV1TEST", "zh")
 
     def test_identify_uses_full_fusion_before_sampled_for_synced_online_lyrics(self):
         online_lyrics = self.synced_lyrics()
@@ -565,6 +649,43 @@ class SampledAlignmentTests(unittest.TestCase):
         duration = duration or max(line["seconds"] for line in lyrics)
         return server.match_sampled_anchors_to_lyrics(lyrics, anchors, duration, duration)
 
+    def test_full_asr_sequence_recovers_online_lyrics_timeline(self):
+        lyrics = [
+            server.lyric_line(26.04, "空荡的街景"),
+            server.lyric_line(30.48, "想找个人放感情"),
+            server.lyric_line(35.05, "做这种决定"),
+            server.lyric_line(38.3, "是寂寞与我为邻"),
+            server.lyric_line(43.92, "我们的爱情"),
+            server.lyric_line(47.08, "像你路过的风景"),
+            server.lyric_line(51.93, "一直在进行"),
+            server.lyric_line(55.68, "脚步却从来不会为我而停"),
+        ]
+        anchors = [{
+            "start": 54.48,
+            "end": 61.7,
+            "text": "一直在驚喜 將卻從來不會為我而停",
+            "words": [
+                {"word": "一直", "start": 54.48, "end": 55.52},
+                {"word": "在", "start": 55.52, "end": 56.18},
+                {"word": "驚", "start": 56.18, "end": 56.86},
+                {"word": "喜", "start": 56.86, "end": 57.28},
+                {"word": "將", "start": 57.94, "end": 58.1},
+                {"word": "卻", "start": 58.1, "end": 58.34},
+                {"word": "從", "start": 58.34, "end": 58.68},
+                {"word": "來", "start": 58.68, "end": 58.96},
+                {"word": "不會", "start": 58.96, "end": 59.52},
+                {"word": "為", "start": 59.52, "end": 60.16},
+                {"word": "我", "start": 60.16, "end": 60.64},
+                {"word": "而", "start": 60.64, "end": 61.22},
+                {"word": "停", "start": 61.22, "end": 61.7},
+            ],
+        }]
+        matches = server.match_lyrics_to_asr_timeline(lyrics, anchors, 253)
+        self.assertTrue(matches)
+        matched_indexes = [item["lyric_index"] for item in matches]
+        self.assertIn(7, matched_indexes)
+        self.assertAlmostEqual(matches[matched_indexes.index(7)]["audio_seconds"], 58.34, places=2)
+
     def test_suffix_anchor_maps_to_in_line_time(self):
         lyrics = [
             server.lyric_line(193.391, "曾沿着雪路浪游 为何为好事泪流"),
@@ -647,25 +768,88 @@ class SampledAlignmentTests(unittest.TestCase):
     def test_sample_windows(self):
         self.assertEqual(server.build_anchor_sample_windows(59), [])
         self.assertEqual(server.build_anchor_sample_windows(100), [
-            {"start": 12.0, "end": 28.0, "index": 0},
+            {"start": 7.0, "end": 23.0, "index": 0},
             {"start": 42.0, "end": 58.0, "index": 1},
-            {"start": 72.0, "end": 88.0, "index": 2},
+            {"start": 77.0, "end": 93.0, "index": 2},
         ])
         self.assertEqual(server.build_anchor_sample_windows(120), [
-            {"start": 12.0, "end": 36.0, "index": 0},
+            {"start": 6.0, "end": 30.0, "index": 0},
             {"start": 48.0, "end": 72.0, "index": 1},
-            {"start": 84.0, "end": 108.0, "index": 2},
+            {"start": 90.0, "end": 114.0, "index": 2},
         ])
         self.assertEqual(server.build_anchor_sample_windows(60), [
-            {"start": 4.0, "end": 20.0, "index": 0},
+            {"start": 1.0, "end": 17.0, "index": 0},
             {"start": 22.0, "end": 38.0, "index": 1},
-            {"start": 40.0, "end": 56.0, "index": 2},
+            {"start": 43.0, "end": 59.0, "index": 2},
         ])
 
     def test_fixed_offset_fit(self):
         fit = server.robust_timeline_models(self.matches(offset=7.0))
         self.assertEqual(fit["mode"], "sampled_fixed_offset")
         self.assertAlmostEqual(fit["offset"], 7.0)
+
+    def test_two_high_confidence_anchors_accept_fixed_offset(self):
+        matches = [
+            {"lyric_seconds": 38.34, "audio_seconds": 42.0, "similarity": 0.89, "window_index": 0},
+            {"lyric_seconds": 45.18, "audio_seconds": 47.98, "similarity": 1.0, "window_index": 0},
+        ]
+        fit = server.robust_timeline_models(matches)
+        self.assertEqual(fit["mode"], "sampled_fixed_offset")
+        self.assertAlmostEqual(fit["offset"], 3.23, places=2)
+
+    def test_structured_coverage_is_safe_in_quality_scoring(self):
+        correction = {"aligned_to_video": True, "coverage": {"line_ratio": 0.4}, "avg_similarity": 0.8, "matched_count": 8}
+        quality = server.synced_fallback_quality({"correction": correction}, "lrclib")
+        self.assertEqual(quality[5], 0)
+        self.assertGreater(server.candidate_audio_score(correction), 0)
+        self.assertTrue(server.cover_candidate_has_strong_audio({}, {}, correction))
+
+    def test_anchor_coverage_rejects_sparse_three_region_matches(self):
+        matches = [
+            {"lyric_seconds": 20, "audio_seconds": 22.5, "similarity": 0.9, "window_index": 0, "lyric_index": 1},
+            {"lyric_seconds": 100, "audio_seconds": 102.5, "similarity": 0.9, "window_index": 1, "lyric_index": 10},
+            {"lyric_seconds": 180, "audio_seconds": 182.5, "similarity": 0.9, "window_index": 2, "lyric_index": 20},
+        ]
+        coverage = server.timeline_anchor_coverage(matches, 30)
+        self.assertEqual(coverage["region_count"], 3)
+        self.assertLess(coverage["line_ratio"], 0.28)
+        fit = server.robust_timeline_models(matches, 30)
+        self.assertEqual(fit["mode"], "unverified")
+        self.assertEqual(fit["reason"], "low_confidence_or_coverage")
+
+    def test_anchor_coverage_accepts_broad_unique_matches(self):
+        indexes = [0, 3, 6, 9, 12, 15, 18, 21, 24, 27, 28, 29]
+        matches = [
+            {"lyric_seconds": index * 10, "audio_seconds": index * 10 + 2.5, "similarity": 0.9, "window_index": position // 4, "lyric_index": index}
+            for position, index in enumerate(indexes)
+        ]
+        coverage = server.timeline_anchor_coverage(matches, 30)
+        self.assertEqual(coverage["unique_lines"], 12)
+        self.assertGreaterEqual(coverage["line_ratio"], 0.28)
+        self.assertEqual(coverage["region_count"], 3)
+        fit = server.robust_timeline_models(matches, 30)
+        self.assertEqual(fit["mode"], "sampled_fixed_offset")
+
+    def test_sequence_consensus_accepts_noisy_whisper_text(self):
+        matches = []
+        for index, value in enumerate([52, 62, 71, 100, 110, 118, 135, 143, 178]):
+            matches.append({
+                "lyric_seconds": value,
+                "audio_seconds": value + 2.5,
+                "similarity": 0.6 if index not in (2, 5) else 0.9,
+                "window_index": min(2, index // 3),
+            })
+        fit = server.robust_timeline_models(matches)
+        self.assertEqual(fit["mode"], "sampled_fixed_offset")
+        self.assertAlmostEqual(fit["offset"], 2.5, places=2)
+
+    def test_two_anchors_reject_inconsistent_offset(self):
+        matches = [
+            {"lyric_seconds": 38.34, "audio_seconds": 42.0, "similarity": 0.95, "window_index": 0},
+            {"lyric_seconds": 45.18, "audio_seconds": 51.0, "similarity": 1.0, "window_index": 0},
+        ]
+        fit = server.robust_timeline_models(matches)
+        self.assertEqual(fit["mode"], "unverified")
 
     def test_linear_scale_fit(self):
         noisy = self.matches(scale=1.02, offset=3.0)
@@ -718,6 +902,20 @@ class SampledAlignmentTests(unittest.TestCase):
     def test_low_confidence_falls_back(self):
         fit = server.robust_timeline_models(self.matches(similarity=0.7)[:3])
         self.assertEqual(fit["mode"], "unverified")
+
+    def test_anchor_timeline_uses_local_line_offsets(self):
+        lyrics = [
+            server.lyric_line(30, "第一句"),
+            server.lyric_line(40, "第二句"),
+            server.lyric_line(50, "第三句"),
+        ]
+        matches = [
+            {"lyric_seconds": 30, "audio_seconds": 28, "similarity": 0.9, "lyric_index": 0},
+            {"lyric_seconds": 40, "audio_seconds": 39, "similarity": 0.9, "lyric_index": 1},
+            {"lyric_seconds": 50, "audio_seconds": 50, "similarity": 0.9, "lyric_index": 2},
+        ]
+        transformed = server.apply_anchor_timeline(lyrics, matches, 1.0, -1.0)
+        self.assertEqual([line["seconds"] for line in transformed], [28.0, 39.0, 50.0])
 
     def test_transform_is_nonnegative_and_strictly_monotonic(self):
         lyrics = [

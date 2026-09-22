@@ -113,11 +113,12 @@ function fallbackSong(url) {
   return {
     title: inferTitleFromUrl(url),
     source: url,
-      bvid: String(url || '').match(/BV[0-9A-Za-z]+/i)?.[0] || '',
-      cid: '',
-      videoStreamUrl: '',
-      videoOffsetSeconds: 0,
-      lyricsSource: 'demo',
+    bvid: String(url || '').match(/BV[0-9A-Za-z]+/i)?.[0] || '',
+    cid: '',
+    videoStreamUrl: apiUrl(`/api/video?url=${encodeURIComponent(url)}`),
+    videoWarning: '歌词识别服务暂时不可用，正在尝试直接播放本地视频。',
+    videoOffsetSeconds: 0,
+    lyricsSource: 'demo',
     lyrics: normalizeLyrics([
       { time: '00:00', text: '识别服务没有启动，先确认启动窗口是否还开着。' },
       { time: '00:06', text: '启动后再粘贴 B站链接，就会自动匹配歌词。' }

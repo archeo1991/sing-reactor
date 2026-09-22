@@ -2,6 +2,37 @@ import ipaddress
 import socket
 from urllib.error import HTTPError
 from urllib.parse import urljoin, urlsplit, urlunsplit
+
+
+def validate_public_url(value, allowed_hosts):
+    text = str(value or "").strip()
+    try:
+        parsed = urlsplit(text)
+        port = parsed.port
+    except ValueError as exc:
+        raise UnsafeUrlError("invalid_url") from exc
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        raise UnsafeUrlError("invalid_scheme")
+    if parsed.username is not None or parsed.password is not None:
+        raise UnsafeUrlError("userinfo_not_allowed")
+    if port is not None and port != (80 if parsed.scheme == "http" else 443):
+        raise UnsafeUrlError("port_not_allowed")
+    host = (parsed.hostname or "").rstrip(".").lower()
+    allowed = tuple(str(item).lower().lstrip(".") for item in (allowed_hosts or ()))
+    if not host or not any(host == item or host.endswith("." + item) for item in allowed):
+        raise UnsafeUrlError("host_not_allowed")
+    try:
+        ipaddress.ip_address(host)
+        raise UnsafeUrlError("ip_not_allowed")
+    except ValueError:
+        pass
+    try:
+        addresses = {item[4][0].split("%", 1)[0] for item in socket.getaddrinfo(host, port or (443 if parsed.scheme == "https" else 80), type=socket.SOCK_STREAM)}
+    except OSError as exc:
+        raise UnsafeUrlError("host_unresolved") from exc
+    if not addresses or any(not ipaddress.ip_address(address).is_global for address in addresses):
+        raise UnsafeUrlError("local_address_not_allowed")
+    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path or "/", parsed.query, ""))
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 

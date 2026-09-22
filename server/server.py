@@ -1,9 +1,11 @@
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, urlencode, urljoin, urlparse
-from urllib.request import Request, urlopen
+from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
 from difflib import SequenceMatcher
 from statistics import median
 import html
+from html.parser import HTMLParser
+from urllib.error import HTTPError, URLError
 import hashlib
 import json
 import math
@@ -20,7 +22,7 @@ import unicodedata
 import uuid
 from pathlib import Path
 
-from http_safety import UnsafeUrlError, parse_single_range, resolve_bilibili_redirects, validate_bilibili_url
+from http_safety import UnsafeUrlError, parse_single_range, resolve_bilibili_redirects, validate_bilibili_url, validate_public_url
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 LYRICS_CONFIG_PATH = Path(__file__).resolve().parent / "lyrics_config.json"
@@ -176,7 +178,9 @@ def infer_metadata_language_hint(text):
         return "ko"
     if len(re.findall(r"[\u3400-\u4dbf\u4e00-\u9fff]", text)) >= 2:
         return "zh"
-    if len(re.findall(r"[A-Za-z]+", text)) >= 2:
+    noise = {"live", "cover", "official", "video", "audio", "lyrics", "mv", "hd", "4k", "8k"}
+    words = [word for word in re.findall(r"[A-Za-z]+", text) if word.lower() not in noise]
+    if sum(len(word) for word in words) >= 4:
         return "en"
     return "auto"
 
@@ -466,15 +470,26 @@ def normalize_song_query(title):
     if quoted:
         return quoted[-1].strip()
     title = re.sub(r"【.*?】|\[.*?\]|（.*?）|\(.*?\)", " ", title or "")
-    title = re.sub(r"(官方|完整版|翻唱|cover|MV|Live|现场|歌词|字幕|伴奏|纯享)", " ", title, flags=re.I)
+    title = re.sub(r"(官方|完整版|翻唱|cover|MV|Live|现场|歌词|字幕|伴奏|纯享|上传|無損|无损|高清|超清|修复版|修復版|修复|修復|Hi-Res|HiRes|4K|8K)", " ", title, flags=re.I)
     title = title.replace("《", " ").replace("》", " ")
     title = re.sub(r"\s+", " ", title).strip()
     return title
 
 
+TRADITIONAL_ALIGNMENT_TRANSLATION = str.maketrans({
+    "時": "时", "光": "光", "穿": "穿", "斷": "断", "轉": "转", "從": "从", "前": "前",
+    "刻": "刻", "骨": "骨", "變": "变", "遙": "遥", "遠": "远", "萬": "万", "年": "年",
+    "深": "深", "情": "情", "愛": "爱", "像": "像", "烈": "烈", "火": "火", "般": "般",
+    "蔓": "蔓", "延": "延", "記": "记", "憶": "忆", "條": "条", "長": "长", "線": "线",
+    "盤": "盘", "旋": "旋", "邊": "边", "還": "还", "為": "为", "你": "你", "這": "这",
+    "麼": "么", "嗎": "吗", "說": "说", "對": "对", "與": "与", "來": "来", "無": "无",
+    "聲": "声", "會": "会", "場": "场", "樂": "乐", "詞": "词", "曲": "曲", "製": "制",
+})
+
+
 def normalize_alignment_text(text):
     text = html.unescape(str(text or ""))
-    text = unicodedata.normalize("NFKC", text).lower()
+    text = unicodedata.normalize("NFKC", text).translate(TRADITIONAL_ALIGNMENT_TRANSLATION).lower()
     text = re.sub(r"\[[^\]]+\]", " ", text)
     text = re.sub(r"^[男女合]\s*[:：]", "", text)
     text = re.sub(r"[（(][^）)]{0,16}[）)]", " ", text)
@@ -715,6 +730,165 @@ def fetch_subtitle_lines(bvid, cid):
         for item in body
         if str(item.get("content") or "").strip()
     ]
+
+
+LYRICS_WEB_HOSTS = frozenset({
+    "lrclib.net", "genius.com", "musixmatch.com", "azlyrics.com", "lyrics.com",
+    "lyricsfreak.com", "songlyrics.com", "lyricstranslate.com", "mojim.com",
+    "kugou.com", "kuwo.cn", "qq.com", "music.163.com",
+})
+
+
+class _LyricsWebParser(HTMLParser):
+    PREFERRED_HINTS = ("lyric", "lyrics", "lrc", "song-text", "songtext", "geci", "歌词")
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.parts = []
+        self.preferred_parts = []
+        self.json_documents = []
+        self.stack = []
+        self.skip = 0
+        self.json_depth = 0
+        self.preferred = 0
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        marker = f"{attrs.get('id', '')} {attrs.get('class', '')}".lower()
+        is_json = tag == "script" and "ld+json" in str(attrs.get("type", "")).lower()
+        is_skip = tag in {"script", "style", "noscript", "svg", "nav", "footer", "header", "aside", "form"} and not is_json
+        is_preferred = not is_skip and not is_json and any(word in marker for word in self.PREFERRED_HINTS)
+        self.stack.append((tag, is_skip, is_json, is_preferred))
+        self.skip += int(is_skip)
+        self.json_depth += int(is_json)
+        self.preferred += int(is_preferred)
+        if is_json:
+            self.json_documents.append([])
+        if not self.skip and not self.json_depth and tag in {"br", "p", "div", "li", "pre", "section", "article", "tr"}:
+            self._append("\n")
+
+    def handle_endtag(self, tag):
+        match_index = next((index for index in range(len(self.stack) - 1, -1, -1) if self.stack[index][0] == tag), None)
+        if match_index is None:
+            return
+        closing = self.stack[match_index:]
+        if not self.skip and not self.json_depth and tag in {"p", "div", "li", "pre", "section", "article", "tr"}:
+            self._append("\n")
+        del self.stack[match_index:]
+        self.skip -= sum(int(item[1]) for item in closing)
+        self.json_depth -= sum(int(item[2]) for item in closing)
+        self.preferred -= sum(int(item[3]) for item in closing)
+
+    def handle_data(self, data):
+        if self.json_depth:
+            self.json_documents[-1].append(data)
+        elif not self.skip:
+            self._append(data)
+
+    def _append(self, text):
+        self.parts.append(text)
+        if self.preferred:
+            self.preferred_parts.append(text)
+
+
+def _filtered_web_lyrics(source):
+    filters = LYRICS_CONFIG.get("candidate_filter") or {}
+    patterns = []
+    for key in ("metadata_line_patterns", "noise_patterns", "ui_only_patterns"):
+        patterns.extend(filters.get(key) or [])
+    lines = []
+    for raw in str(source or "").splitlines():
+        text = re.sub(r"\s+", " ", html.unescape(raw)).strip()
+        if not text or any(re.search(pattern, text, re.I) for pattern in patterns):
+            continue
+        lines.append(lyric_line(len(lines) * 6, text))
+    return clean_lyric_lines(lines)
+
+
+def extract_web_lyrics_text(page):
+    parser = _LyricsWebParser()
+    parser.feed(str(page or ""))
+    minimum = int((LYRICS_CONFIG.get("candidate_filter") or {}).get("minimum_candidate_lines", 2))
+    preferred_minimum = int((LYRICS_CONFIG.get("candidate_filter") or {}).get("page_lines_preferred_minimum", minimum))
+    sources = [("preferred", "".join(parser.preferred_parts))]
+    for document in parser.json_documents:
+        try:
+            payload = json.loads("".join(document))
+        except (TypeError, ValueError):
+            continue
+
+        def visit(value, key=""):
+            if isinstance(value, dict):
+                for child_key, child in value.items():
+                    visit(child, str(child_key).lower())
+            elif isinstance(value, list):
+                for child in value:
+                    visit(child, key)
+            elif isinstance(value, str) and key in {"lyrics", "lyric", "text", "articlebody", "description"}:
+                sources.append(("json", value))
+
+        visit(payload)
+    sources.append(("body", "".join(parser.parts)))
+    best = []
+    for kind, source in sources:
+        timed = clean_lyric_lines(parse_lrc(source))
+        lines = timed or _filtered_web_lyrics(source)
+        required = preferred_minimum if kind == "preferred" else minimum
+        if len(lines) >= required:
+            if kind == "preferred":
+                return lines
+            if len(lines) > len(best):
+                best = lines
+    return best
+
+
+def validate_lyrics_web_url(url):
+    return validate_public_url(url, LYRICS_WEB_HOSTS)
+
+
+class _LyricsRedirectHandler(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        safe_url = validate_lyrics_web_url(urljoin(req.full_url, newurl))
+        return super().redirect_request(req, fp, code, msg, headers, safe_url)
+
+
+def fetch_web_lyrics_candidate(url):
+    try:
+        safe_url = validate_lyrics_web_url(url)
+        request = Request(safe_url, headers={"User-Agent": "Mozilla/5.0", "Accept": "text/html,text/plain,application/json"})
+        with build_opener(_LyricsRedirectHandler()).open(request, timeout=8) as response:
+            final_url = validate_lyrics_web_url(response.geturl())
+            body = response.read(1024 * 1024 + 1)
+            if len(body) > 1024 * 1024:
+                return None
+            lines = extract_web_lyrics_text(body.decode(response.headers.get_content_charset() or "utf-8", errors="replace"))
+        return {"provider": "web", "trackName": "", "artistName": "", "source_url": final_url, "lrc_text": "", "plain_text": "\n".join(item["text"] for item in lines), "lines": lines, "score": 0.55} if lines else None
+    except (UnsafeUrlError, HTTPError, URLError, OSError, LookupError, ValueError):
+        return None
+
+
+def search_web_lyrics_candidates(song_title, artist=None):
+    query = " ".join(part for part in (artist, song_title, "歌词") if part)
+    if not query:
+        return []
+    search_url = "https://www.bing.com/search?format=rss&q=" + quote(query)
+    try:
+        safe_search = validate_public_url(search_url, {"www.bing.com"})
+        with urlopen(Request(safe_search, headers={"User-Agent": "Mozilla/5.0"}), timeout=8) as response:
+            root = __import__("xml.etree.ElementTree", fromlist=["fromstring"]).fromstring(response.read(512 * 1024))
+        urls = []
+        for item in root.findall(".//item"):
+            link = (item.findtext("link") or "").strip()
+            if link:
+                urls.append(link)
+        candidates = []
+        for link in urls[: int((LYRICS_CONFIG.get("search") or {}).get("results_per_query", 3))]:
+            candidate = fetch_web_lyrics_candidate(link)
+            if candidate:
+                candidates.append(candidate)
+        return candidates
+    except (UnsafeUrlError, HTTPError, URLError, OSError, ValueError):
+        return []
 
 
 def split_alignment_units(text):
@@ -1244,6 +1418,38 @@ def match_sampled_anchors_to_lyrics(lyrics, sampled_anchors, candidate_duration,
     return matches
 
 
+def match_lyrics_to_asr_timeline(lyrics, anchors, media_duration=0):
+    if not lyrics or not anchors:
+        return []
+    units = anchor_time_units(anchors)
+    active_indexes = [index for index, line in enumerate(lyrics) if alignment_line_is_usable(line.get("text"))]
+    if not units or not active_indexes:
+        return []
+    candidate_rows = [
+        lyric_span_candidates(index, lyrics[index].get("text"), units, lyrics[index].get("seconds"), top_k=12)
+        for index in active_indexes
+    ]
+    selected = select_monotonic_alignment(candidate_rows, active_indexes, len(units))
+    duration = float(media_duration or 0)
+    matches = []
+    for item in selected:
+        lyric_seconds = float(lyrics[item["line_index"]].get("seconds") or 0)
+        audio_seconds = float(item["seconds"])
+        window_index = min(2, max(0, int(audio_seconds / duration * 3))) if duration > 0 else 0
+        matches.append({
+            "lyric_seconds": lyric_seconds,
+            "line_seconds": lyric_seconds,
+            "expected_lyric_seconds": lyric_seconds,
+            "audio_seconds": audio_seconds,
+            "similarity": float(item["similarity"]),
+            "window_index": window_index,
+            "lyric_index": item["line_index"],
+            "text": lyrics[item["line_index"]].get("text"),
+            "anchor_text": "",
+        })
+    return matches
+
+
 def timeline_point_seconds(item):
     return float(item.get("expected_lyric_seconds", item["lyric_seconds"]))
 
@@ -1259,8 +1465,26 @@ def timeline_fit_metrics(matches, scale, offset):
     }
 
 
-def robust_timeline_models(matches):
+def timeline_anchor_coverage(matches, total_lines=0):
+    indexed = [item for item in matches or [] if item.get("lyric_index") is not None]
+    if not indexed or not total_lines:
+        return {"coverage_available": False, "unique_lines": len(matches or []), "line_ratio": 1.0, "region_count": 3, "duplicate_region_ratio": 0.0}
+    total = max(1, int(total_lines or (max(int(item["lyric_index"]) for item in indexed) + 1)))
+    unique_indexes = {int(item["lyric_index"]) for item in indexed}
+    regions = {min(2, max(0, int(int(item["lyric_index"]) / total * 3))) for item in indexed}
+    region_counts = [sum(1 for item in indexed if min(2, max(0, int(int(item["lyric_index"]) / total * 3))) == region) for region in range(3)]
+    return {
+        "coverage_available": True,
+        "unique_lines": len(unique_indexes),
+        "line_ratio": len(unique_indexes) / total,
+        "region_count": len(regions),
+        "duplicate_region_ratio": max(region_counts, default=0) / max(1, len(indexed)),
+    }
+
+
+def robust_timeline_models(matches, total_lines=0):
     points = sorted(matches or [], key=lambda item: (timeline_point_seconds(item), float(item["audio_seconds"])))
+    coverage = timeline_anchor_coverage(points, total_lines)
     if not points:
         return {"mode": "unverified", "reason": "no_matches", "matched_count": 0}
 
@@ -1298,12 +1522,38 @@ def robust_timeline_models(matches):
             "avg_similarity": sum(float(item["similarity"]) for item in items) / max(1, len(items)),
             "max_similarity": max((float(item["similarity"]) for item in items), default=0),
             "span": (max(timeline_point_seconds(item) for item in items) - min(timeline_point_seconds(item) for item in items)) if items else 0,
+            **timeline_anchor_coverage(items, total_lines),
         }
 
     fixed_summary = summary(fixed_inliers)
     linear_summary = summary(linear_inliers)
+    coverage_config = LYRICS_CONFIG.get("timeline_coverage") or {}
+    min_line_ratio = float(coverage_config.get("minimum_line_ratio", 0.28))
+    min_unique_lines = int(coverage_config.get("minimum_unique_lines", 8))
+    min_regions = int(coverage_config.get("minimum_regions", 3))
+    duplicate_region_ratio = float(coverage_config.get("duplicate_region_ratio", 0.45))
+    coverage_available = bool(fixed_summary.get("coverage_available"))
+    coverage_ok = (
+        not coverage_available
+        or (
+            fixed_summary["unique_lines"] >= min_unique_lines
+            and fixed_summary["line_ratio"] >= min_line_ratio
+            and fixed_summary["region_count"] >= min_regions
+            and fixed_summary["duplicate_region_ratio"] <= duplicate_region_ratio
+        )
+    )
+    linear_coverage_ok = (
+        not bool(linear_summary.get("coverage_available"))
+        or (
+            linear_summary["unique_lines"] >= min_unique_lines
+            and linear_summary["line_ratio"] >= min_line_ratio
+            and linear_summary["region_count"] >= min_regions
+            and linear_summary["duplicate_region_ratio"] <= duplicate_region_ratio
+        )
+    )
     fixed_text_ok = (
-        fixed_summary["matched_count"] >= 4
+        coverage_ok
+        and fixed_summary["matched_count"] >= 4
         and fixed_summary["window_count"] >= 2
         and fixed_summary["avg_similarity"] >= 0.78
         and fixed_metrics["rmse"] <= 1.5
@@ -1312,7 +1562,8 @@ def robust_timeline_models(matches):
         and abs(fixed_offset) <= 45
     )
     linear_text_ok = (
-        linear_summary["matched_count"] >= 6
+        linear_coverage_ok
+        and linear_summary["matched_count"] >= 6
         and linear_summary["window_count"] >= 3
         and linear_summary["avg_similarity"] >= 0.80
         and linear_metrics["rmse"] <= 1.25
@@ -1324,7 +1575,8 @@ def robust_timeline_models(matches):
         and abs(linear_scale - 1) >= 0.0025
     )
     linear_temporal_ok = (
-        linear_summary["matched_count"] >= 6
+        linear_coverage_ok
+        and linear_summary["matched_count"] >= 6
         and linear_summary["window_count"] == 3
         and linear_summary["avg_similarity"] >= 0.74
         and linear_summary["max_similarity"] >= 0.90
@@ -1340,6 +1592,7 @@ def robust_timeline_models(matches):
     )
     fixed_temporal_ok = (
         not linear_temporal_ok
+        and coverage_ok
         and fixed_summary["matched_count"] >= 5
         and fixed_summary["window_count"] == 3
         and fixed_summary["avg_similarity"] >= 0.74
@@ -1350,14 +1603,80 @@ def robust_timeline_models(matches):
         and fixed_metrics["max_residual"] <= 1.25
         and abs(fixed_offset) <= 45
     )
+    fixed_short_ok = (
+        not linear_temporal_ok
+        and coverage_ok
+        and fixed_summary["matched_count"] >= 2
+        and fixed_summary["avg_similarity"] >= 0.88
+        and fixed_summary["max_similarity"] >= 0.92
+        and fixed_summary["span"] >= 5
+        and fixed_metrics["rmse"] <= 0.75
+        and fixed_metrics["mae"] <= 0.60
+        and fixed_metrics["max_residual"] <= 1.25
+        and abs(fixed_offset) <= 45
+    )
+    fixed_sequence_max_residual = float(coverage_config.get("fixed_sequence_max_residual", 1.75))
+    fixed_sequence_ok = (
+        not linear_temporal_ok
+        and coverage_ok
+        and fixed_summary["matched_count"] >= 8
+        and fixed_summary["window_count"] >= 3
+        and fixed_summary["avg_similarity"] >= 0.58
+        and fixed_summary["max_similarity"] >= 0.88
+        and fixed_summary["span"] >= 90
+        and fixed_metrics["rmse"] <= 0.80
+        and fixed_metrics["mae"] <= 0.65
+        and fixed_metrics["max_residual"] <= fixed_sequence_max_residual
+        and abs(fixed_offset) <= 45
+    )
+    fixed_ok = fixed_text_ok or fixed_temporal_ok or fixed_short_ok or fixed_sequence_ok
     linear_ok = linear_text_ok or linear_temporal_ok
-    fixed_ok = fixed_text_ok or fixed_temporal_ok
-    common = {"matches": points, "fixed_model": {"scale": 1.0, "offset": round(fixed_offset, 6), **fixed_summary, **fixed_metrics}}
+    common = {"matches": points, "coverage": coverage, "fixed_model": {"scale": 1.0, "offset": round(fixed_offset, 6), **fixed_summary, **fixed_metrics}}
     if linear_ok:
         return {"mode": "sampled_linear_timeline", "scale": linear_scale, "offset": linear_offset, "confidence_basis": "text_and_time" if linear_text_ok else "temporal_consensus", **linear_summary, **linear_metrics, **common}
     if fixed_ok:
         return {"mode": "sampled_fixed_offset", "scale": 1.0, "offset": fixed_offset, "confidence_basis": "text_and_time" if fixed_text_ok else "temporal_consensus", **fixed_summary, **fixed_metrics, **common}
-    return {"mode": "unverified", "reason": "low_confidence", **fixed_summary, **fixed_metrics, **common}
+    return {"mode": "unverified", "reason": "low_confidence_or_coverage", **fixed_summary, **fixed_metrics, **common}
+
+
+def apply_anchor_timeline(lyrics, matches, scale=1.0, offset=0.0):
+    anchors = sorted(
+        (float(item["lyric_seconds"]), float(item["audio_seconds"]))
+        for item in matches or []
+        if item.get("lyric_index") is not None and float(item.get("similarity") or 0) >= 0.55
+    )
+    if len(anchors) < 2:
+        return apply_timeline_transform(lyrics, scale, offset)
+    unique = []
+    for lyric_seconds, audio_seconds in anchors:
+        if unique and abs(lyric_seconds - unique[-1][0]) < 0.001:
+            continue
+        unique.append((lyric_seconds, audio_seconds))
+    if len(unique) < 2:
+        return apply_timeline_transform(lyrics, scale, offset)
+
+    transformed = []
+    previous_seconds = -0.001
+    for source in lyrics or []:
+        line = dict(source)
+        source_seconds = float(source.get("seconds") or 0)
+        seconds = source_seconds * float(scale) + float(offset)
+        for left, right in zip(unique, unique[1:]):
+            if left[0] <= source_seconds <= right[0]:
+                ratio = (source_seconds - left[0]) / max(0.001, right[0] - left[0])
+                seconds = left[1] + (right[1] - left[1]) * ratio
+                break
+        seconds = max(0.0, seconds)
+        if seconds <= previous_seconds:
+            seconds = previous_seconds + 0.001
+        line["seconds"] = seconds
+        line["time"] = seconds_to_time(seconds)
+        if "end" in line:
+            duration = max(0.001, float(source.get("end") or source_seconds) - source_seconds)
+            line["end"] = seconds + duration
+        transformed.append(line)
+        previous_seconds = seconds
+    return transformed
 
 
 def apply_timeline_transform(lyrics, scale, offset):
@@ -1735,7 +2054,10 @@ def synced_fallback_quality(meta, provider_name=""):
     confidence = float(correction.get("confidence") or correction.get("avg_similarity") or correction.get("avgSimilarity") or 0)
     matched = int(correction.get("matched_count") or correction.get("matched") or 0)
     windows = int(correction.get("window_count") or 0)
-    coverage = float(correction.get("coverage") or correction.get("line_coverage") or correction.get("character_coverage") or 0)
+    coverage_value = correction.get("coverage")
+    if isinstance(coverage_value, dict):
+        coverage_value = correction.get("line_coverage") or correction.get("character_coverage") or 0
+    coverage = float(coverage_value or 0)
     provider_text_quality = 1 if provider_name == "netease" else 0
     return (int(aligned), int(sampled), confidence, matched, windows, coverage, provider_text_quality)
 
@@ -1757,14 +2079,27 @@ def candidate_match_type(song_metadata, candidate_meta):
     return "exact"
 
 
+def numeric_coverage_value(correction, *keys):
+    for key in keys:
+        value = (correction or {}).get(key)
+        if isinstance(value, dict):
+            value = value.get("line_ratio") or value.get("coverage") or value.get("character_ratio")
+        if value is not None:
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                continue
+    return 0.0
+
+
 def candidate_audio_score(correction):
     correction = correction or {}
     if not correction.get("aligned_to_video"):
         return 0.0
     confidence = float(correction.get("confidence") or correction.get("avg_similarity") or correction.get("avgSimilarity") or 0)
-    line_coverage = float(correction.get("line_coverage") or correction.get("coverage") or 0)
-    character_coverage = float(correction.get("character_coverage") or correction.get("charCoverage") or line_coverage)
-    time_coverage = float(correction.get("time_coverage") or correction.get("timeSpanCoverage") or 0)
+    line_coverage = numeric_coverage_value(correction, "line_coverage", "coverage")
+    character_coverage = numeric_coverage_value(correction, "character_coverage", "charCoverage") or line_coverage
+    time_coverage = numeric_coverage_value(correction, "time_coverage", "timeSpanCoverage")
     return min(1.0, confidence * 0.55 + line_coverage * 0.2 + character_coverage * 0.15 + time_coverage * 0.1)
 
 
@@ -1785,7 +2120,7 @@ def cover_candidate_has_strong_audio(song_metadata, meta, correction):
     config = LYRICS_CONFIG.get("candidate_selection") or {}
     return (
         float((correction or {}).get("confidence") or 0) >= float(config.get("cover_min_confidence", 0.78))
-        and float((correction or {}).get("line_coverage") or (correction or {}).get("coverage") or 0) >= float(config.get("cover_min_line_coverage", 0.55))
+        and numeric_coverage_value(correction, "line_coverage", "coverage") >= float(config.get("cover_min_line_coverage", 0.55))
         and int((correction or {}).get("matched_count") or (correction or {}).get("matched") or 0) >= int(config.get("cover_min_matches", 5))
     )
 
@@ -1985,7 +2320,6 @@ def identify(url):
             "artistName": song_metadata.get("artist"), "score": 0.8, "mode": "text_only",
         }))
     attempted_providers = (["bilibili_subtitle"] if platform_anchors else []) + attempted_providers + (["known_lyrics"] if known_lyrics else [])
-
     language_hint = song_metadata.get("language")
     if language_hint == "auto":
         language_hint = None
@@ -2035,6 +2369,22 @@ def identify(url):
             continue
         fallback_meta = {**candidate_meta, "correction": fallback_correction}
         fallbacks.append((synced_fallback_quality(fallback_meta, provider_name), provider_name, fallback_lyrics, candidate_meta, fallback_correction))
+
+    if not evaluated and not fallbacks:
+        try:
+            attempted_providers.append("web")
+            web_candidates = search_web_lyrics_candidates(song_metadata.get("song_title") or title, song_metadata.get("artist") or artist)
+            for web_candidate in web_candidates:
+                candidate_lyrics = web_candidate.get("lines") or []
+                output_lyrics, correction = align_candidate_lyrics(candidate_lyrics, speech_anchors, None, speech_meta)
+                if correction and correction.get("aligned_to_video"):
+                    web_meta = {**web_candidate, "trackName": song_metadata.get("song_title"), "artistName": "", "source_url": web_candidate.get("source_url")}
+                    if cover_candidate_has_strong_audio(song_metadata, web_meta, correction):
+                        evaluated.append((candidate_total_score("web", web_meta, correction), "web", output_lyrics, web_meta, correction))
+                        break
+                rejected_candidates.append({"provider": "web", "source_url": web_candidate.get("source_url"), "reason": (correction or {}).get("reason", "missing_audio_evidence")})
+        except Exception as exc:
+            warning = warning or f"web_lyrics_failed: {exc.__class__.__name__}"
 
     if evaluated:
         _, lyrics_source, lyrics, selected_meta, selected_correction = max(evaluated, key=lambda item: item[0])
@@ -2454,7 +2804,7 @@ def build_anchor_sample_windows(media_duration):
         return []
     window_length = 24.0 if duration >= 120 else 16.0
     windows = []
-    for center_ratio in (0.2, 0.5, 0.8):
+    for center_ratio in (0.15, 0.5, 0.85):
         center = duration * center_ratio
         start = max(0.0, center - window_length / 2)
         end = min(duration, center + window_length / 2)
@@ -2794,7 +3144,29 @@ def calibrate_synced_lyrics(url, lyrics, candidate_duration, media_duration, lan
     if not anchors:
         return lyrics, {"mode": "unverified", "aligned_to_video": False, "reason": "missing_sampled_anchors", "attempts": attempts}, attempts
     matches = match_sampled_anchors_to_lyrics(lyrics, anchors, candidate_duration, media_duration)
-    fit = robust_timeline_models(matches)
+    coverage_config = LYRICS_CONFIG.get("timeline_coverage") or {}
+    sampled_coverage = timeline_anchor_coverage(matches, len(lyrics))
+    needs_full_sequence = (
+        len(matches) < 2
+        or sampled_coverage["unique_lines"] < int(coverage_config.get("minimum_unique_lines", 8))
+        or sampled_coverage["line_ratio"] < float(coverage_config.get("minimum_line_ratio", 0.28))
+        or sampled_coverage["region_count"] < int(coverage_config.get("minimum_regions", 3))
+        or sampled_coverage["duplicate_region_ratio"] > float(coverage_config.get("duplicate_region_ratio", 0.45))
+    )
+    if needs_full_sequence:
+        full_cached = load_cached_speech(url, language_hint)
+        full_anchors = (full_cached or {}).get("segments") or []
+        if full_anchors:
+            sequence_matches = match_lyrics_to_asr_timeline(lyrics, full_anchors, media_duration)
+            sequence_coverage = timeline_anchor_coverage(sequence_matches, len(lyrics))
+            if (
+                sequence_coverage["unique_lines"] > sampled_coverage["unique_lines"]
+                or sequence_coverage["line_ratio"] > sampled_coverage["line_ratio"]
+                or len(sequence_matches) > len(matches)
+            ):
+                matches = sequence_matches
+                attempts.append({"stage": "lyrics_sequence_alignment", "status": "cached_full", "message": f"采样锚点覆盖不足，已用完整 Whisper 词序列补充 {len(matches)} 个歌词时间锚点。"})
+    fit = robust_timeline_models(matches, len(lyrics))
     fit["anchorProvider"] = (speech_meta or {}).get("provider")
     fit["attempts"] = attempts
     if fit.get("mode") not in ("sampled_fixed_offset", "sampled_linear_timeline"):
@@ -2832,7 +3204,17 @@ def calibrate_synced_lyrics(url, lyrics, candidate_duration, media_duration, lan
         fit["aligned_to_video"] = False
         return lyrics, fit, attempts
     fit["aligned_to_video"] = True
-    transformed = apply_timeline_transform(lyrics, fit["scale"], fit["offset"])
+    fit_coverage = fit.get("coverage") or {}
+    if (
+        bool(fit_coverage.get("coverage_available"))
+        and int(fit_coverage.get("unique_lines") or 0) >= int(coverage_config.get("minimum_unique_lines", 8))
+        and float(fit_coverage.get("line_ratio") or 0) >= float(coverage_config.get("minimum_line_ratio", 0.28))
+        and int(fit_coverage.get("region_count") or 0) >= int(coverage_config.get("minimum_regions", 3))
+    ):
+        transformed = apply_anchor_timeline(lyrics, fit.get("matches"), fit["scale"], fit["offset"])
+        fit["mode"] = "sampled_anchor_timeline"
+    else:
+        transformed = apply_timeline_transform(lyrics, fit["scale"], fit["offset"])
     return transformed, fit, attempts
 
 
@@ -2926,7 +3308,9 @@ def ensure_cached_video(url):
 def get_safe_video_stream_url(url, lyrics, source_duration=0):
     if not is_bilibili_url(url):
         return None
-    if cached_video_path(url).exists() or (get_yt_dlp_command() and get_ffmpeg_path()):
+    cached_path = cached_video_path(url)
+    tools_available = bool(get_yt_dlp_command() and get_ffmpeg_path())
+    if cached_path.exists() or tools_available:
         return f"/api/video?url={quote(url, safe='')}"
     return None
 

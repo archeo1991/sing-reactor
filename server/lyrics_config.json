@@ -1,27 +1,15 @@
 {
   "schema_version": 1,
-  "pipeline_version": 2,
-  "provider_quality": {
-    "bilibili_subtitle": 0.72,
-    "netease": 0.85,
-    "lrclib": 0.9,
-    "known_lyrics": 0.7,
-    "video_recognition": 0.5,
-    "whisper": 0.35
-  },
-  "candidate_selection": {
-    "metadata_weight": 0.14,
-    "provider_weight": 0.06,
-    "audio_weight": 0.8,
-    "cover_min_confidence": 0.78,
-    "cover_min_line_coverage": 0.55,
-    "cover_min_matches": 5
-  },
-  "fallback": {
-    "allow_original_synced": true,
-    "allow_whisper_text": true,
-    "allow_weak_timeline_rebuild": true,
-    "weak_timeline_min_similarity": 0.86,
-    "weak_timeline_max_offset": 45
-  }
+  "pipeline_version": 3,
+  "title_cleanup": {"removable_terms": [], "date_patterns": [], "venue_suffix_patterns": []},
+  "metadata": {"extract_book_title": true, "bracket_patterns": ["【([^】]*)】", "\\[([^\\]]*)\\]", "（([^）]*)）", "\\(([^)]*)\\)"], "discovery_title_patterns": [], "book_title_pattern": "《\\s*([^《》]{1,80}?)\\s*》", "artist_title_separators": ["\\s+-\\s+"]},
+  "search": {"max_queries": 4, "results_per_query": 3, "max_candidates": 8, "lrclib_enabled": true, "lrclib_max_results": 6, "netease_enabled": true, "netease_max_results": 5, "query_templates": {"with_artist": ["{artist} {song} 歌词 LRC", "{song} {artist} LRC"], "without_artist": ["{song} 歌词 LRC"], "latin": ["{song} {artist} lyrics lrc"], "non_latin": []}},
+  "candidate_filter": {"minimum_candidate_lines": 2, "alignment_confidence_threshold": 0.64, "source_title_similarity_threshold": 0.82, "artist_match_threshold": 0.88, "strong_audio_coverage": 0.72, "strong_audio_average_confidence": 0.82, "strong_audio_high_confidence_ratio": 0.8, "text_consistency_min_matches": 2, "text_consistency_average_confidence": 0.82, "text_only_minimum_ratio": 0.25, "text_only_minimum_multiple": 2, "text_only_minimum_single": 1, "metadata_line_patterns": ["^(?:作词|作曲|编曲|制作|演唱|原唱|版权)\\s*[:：]"], "noise_patterns": ["(?:条评论|相关推荐|返回首页|隐私政策|用户协议|版权|广告)"], "ui_only_patterns": ["^(?:纯歌词|LRC歌词|复制)$"], "page_lines_preferred_minimum": 3, "combined_snippet_minimum": 3},
+  "script_tracks": {"enabled": true, "priority": ["ja", "han", "latin", "other"], "minimum_lines": 3, "minimum_substantial_tracks": 2, "preferred_source_minimum_lines": 6},
+  "lrc_sync": {"similarity_threshold": 0.68, "single_anchor_threshold": 0.9, "short_clip_max_duration": 12.0, "offset_cluster_tolerance": 0.75, "max_offset_spread": 1.5, "display_lead_seconds": -0.2, "preserve_between_anchors": true, "linear_min_anchors": 4, "linear_min_span": 20.0, "linear_scale_min": 0.94, "linear_scale_max": 1.06, "linear_rmse_improvement": 0.15},
+  "provider_quality": {"bilibili_subtitle": 0.72, "netease": 0.85, "lrclib": 0.9, "known_lyrics": 0.7, "video_recognition": 0.5, "whisper": 0.35, "web": 0.55},
+  "timeline_quality": {"min_lines": 2, "min_anchored_lines": 2, "high_confidence_threshold": 0.64, "high_confidence_ratio": 0.7, "average_confidence": 0.72, "coverage": 0.62, "single_line_coverage": 0.65, "single_line_average_confidence": 0.78, "per_line_minimum_confidence": 0.6, "single_anchor_max_units": 3},
+  "timeline_coverage": {"minimum_line_ratio": 0.28, "minimum_unique_lines": 8, "minimum_regions": 3, "duplicate_region_ratio": 0.45, "fixed_sequence_max_residual": 1.75},
+  "candidate_selection": {"metadata_weight": 0.14, "provider_weight": 0.06, "audio_weight": 0.8, "cover_min_confidence": 0.78, "cover_min_line_coverage": 0.55, "cover_min_matches": 5},
+  "fallback": {"allow_original_synced": true, "allow_whisper_text": true, "allow_weak_timeline_rebuild": true, "weak_timeline_min_similarity": 0.86, "weak_timeline_max_offset": 45, "enable_text_only": true}
 }
